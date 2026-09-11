@@ -6,6 +6,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import io
+import numpy as np
+import segyio
+from pathlib import Path
 
 st.set_page_config(page_title="CCS Digital Twin", layout="wide")
 
@@ -121,6 +124,90 @@ def metric_card(label: str, value: float, unit: str = "", color: str = "#0078D4"
 def toggle_flow_unit():
     current_unit = st.session_state.get("flow_unit", "flow_bpm")
     st.session_state["flow_unit"] = "flow_gpm" if current_unit == "flow_bpm" else "flow_bpm"
+
+
+@st.cache_data(show_spinner=False)
+def load_segy_file(file_path: str):
+    """Load a SEGY gather and return a compact, serializable analysis bundle."""
+    with segyio.open(file_path, "r", ignore_geometry=True) as segy_file:
+        trace_count = segy_file.tracecount
+        samples = np.asarray(segy_file.samples, dtype=float)
+        traces = np.asarray(segy_file.trace.raw[:trace_count], dtype=np.float32)
+        traces = np.nan_to_num(traces, nan=0.0, posinf=0.0, neginf=0.0)
+        robust_limit = float(np.percentile(np.abs(traces), 99.9) * 10)
+        if robust_limit > 0:
+            traces = np.clip(traces, -robust_limit, robust_limit)
+        group_x = np.asarray(segy_file.attributes(segyio.TraceField.GroupX)[:trace_count])
+        group_y = np.asarray(segy_file.attributes(segyio.TraceField.GroupY)[:trace_count])
+        sample_interval_us = float(segyio.dt(segy_file))
+
+    return {
+        "traces": traces,
+        "samples": samples,
+        "sample_interval_us": sample_interval_us,
+        "group_x": group_x,
+        "group_y": group_y,
+        "trace_count": trace_count,
+    }
+
+
+def apply_fft_bandpass(trace, sample_rate_hz, low_hz, high_hz):
+    frequencies = np.fft.rfftfreq(trace.size, d=1.0 / sample_rate_hz)
+    spectrum = np.fft.rfft(trace)
+    mask = (frequencies >= low_hz) & (frequencies <= high_hz)
+    return np.fft.irfft(spectrum * mask, n=trace.size)
+
+
+def get_fft_spectrum(trace, sample_rate_hz):
+    centered = trace - np.mean(trace)
+    frequencies = np.fft.rfftfreq(centered.size, d=1.0 / sample_rate_hz)
+    amplitude = np.abs(np.fft.rfft(centered)) / max(centered.size, 1)
+    return frequencies, amplitude
+
+
+def build_segy_file_index(segy_dir):
+    files = {}
+    for path in Path(segy_dir).glob("event_*_*_strain_geom.sgy"):
+        parts = path.stem.split("_")
+        if len(parts) >= 5:
+            files[(int(parts[1]), f"CRC-{parts[2]}")] = path
+    return files
+
+
+def style_segy_figure(fig, height=460):
+    fig.update_layout(
+        height=height,
+        margin=dict(l=12, r=12, t=52, b=12),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0b1720",
+        font=dict(family="IBM Plex Sans, sans-serif", color="#c5d2d8"),
+        title=dict(x=0.02, xanchor="left", font=dict(size=16, color="#edf5f4")),
+        hoverlabel=dict(bgcolor="#13242d", font_size=12),
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False, color="#90a5ad")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(164, 194, 201, 0.12)", zeroline=False, color="#90a5ad")
+    return fig
+
+
+EVENT_CATALOG = {
+    2: {"date": "2020-10-29 02:29", "easting": 658631.5, "northing": 5733858, "depth": 1490, "magnitude": -1.0, "corner": 90},
+    11: {"date": "2021-02-25 20:23", "easting": 658804.5, "northing": 5733873, "depth": 1510, "magnitude": None, "corner": None},
+    12: {"date": "2021-02-25 22:10", "easting": 657879.3, "northing": 5733980, "depth": 1470, "magnitude": None, "corner": None},
+    13: {"date": "2021-02-25 23:10", "easting": 657899, "northing": 5733950, "depth": 1470, "magnitude": None, "corner": None},
+    4: {"date": "2021-01-30 16:55", "easting": 657999.1, "northing": 5733742, "depth": 1470, "magnitude": -1.1, "corner": 180},
+    5: {"date": "2021-01-30 18:46", "easting": 657992.4, "northing": 5733723, "depth": 1470, "magnitude": -0.5, "corner": 180},
+    6: {"date": "2021-02-06 10:41", "easting": 657979.2, "northing": 5733722, "depth": 1450, "magnitude": -0.7, "corner": 180},
+    7: {"date": "2021-02-07 13:19", "easting": 657991.7, "northing": 5733721, "depth": 1450, "magnitude": -1.3, "corner": 130},
+    8: {"date": "2021-02-07 14:20", "easting": 658016.3, "northing": 5733785, "depth": 1430, "magnitude": -1.5, "corner": 110},
+    9: {"date": "2021-02-07 14:21", "easting": 658010.5, "northing": 5733768, "depth": 1450, "magnitude": -1.0, "corner": 150},
+    10: {"date": "2021-02-07 15:48", "easting": 657999.4, "northing": 5733740, "depth": 1470, "magnitude": -1.5, "corner": 150},
+    14: {"date": "2021-02-26 09:39", "easting": 657997, "northing": 5733742, "depth": 1470, "magnitude": -0.6, "corner": 180},
+    16: {"date": "2021-03-16 01:54", "easting": 658013.6, "northing": 5733770, "depth": 1450, "magnitude": None, "corner": None},
+    18: {"date": "2021-04-14 08:58", "easting": 658454.8, "northing": 5733845, "depth": 1470, "magnitude": None, "corner": None},
+    20: {"date": "2021-06-13 05:11", "easting": 658633.5, "northing": 5734494, "depth": 1490, "magnitude": -0.3, "corner": 140},
+    21: {"date": "2021-06-25 05:48", "easting": 658562.1, "northing": 5734460, "depth": 1450, "magnitude": 0.1, "corner": 140},
+    24: {"date": "2021-11-06 23:35", "easting": 658347.3, "northing": 5733978, "depth": 1450, "magnitude": -1.0, "corner": 120},
+}
 
 # Sidebar navigation (vertical only)
 get_qs = getattr(st, "experimental_get_query_params", None)
@@ -458,18 +545,176 @@ elif page == "Anomaly Detection":
                 st.plotly_chart(fig2, use_container_width=True)
 
 elif page == "SEGY Analysis":
-    import os
-    with col1:
-        st.header("SEGY Analysis")
-        segy_dir = "data/segy"
-        segy_files = []
-        try:
-            segy_files = [f for f in os.listdir(segy_dir) if f.lower().endswith('.sgy') or f.lower().endswith('.segy')]
-        except Exception:
-            segy_files = []
-        sel = st.selectbox("SEGY file", options=segy_files)
-        if st.button("Analyze SEGY") and sel:
-            st.info(f"Placeholder: run SEGY analysis for {sel}.")
-            st.write("Implement SEGY analysis backend endpoint and visualization here.")
+    st.markdown(
+        "<style>\n"
+        ".segy-hero {padding: 1.25rem 1.5rem; border: 1px solid #28424a; border-radius: 10px; background: linear-gradient(115deg, #10252d 0%, #152e34 56%, #183a37 100%); margin-bottom: 1rem;}\n"
+        ".segy-kicker {color: #70d7bf; font-size: .74rem; letter-spacing: .14em; text-transform: uppercase; font-weight: 700;}\n"
+        ".segy-hero h1 {color: #f2f8f6; font-size: 2rem; margin: .25rem 0 .35rem;}\n"
+        ".segy-hero p {color: #b7c9c9; margin: 0; max-width: 760px;}\n"
+        "</style>\n"
+        "<div class='segy-hero'><div class='segy-kicker'>CO₂CRC Otway Stage 3</div>"
+        "<h1>Microseismic Event &amp; SEGY Analysis Dashboard</h1>"
+        "<p>Explore enhanced DAS waveforms, event locations, frequency content, and trace-level signal quality across the monitoring wells.</p></div>",
+        unsafe_allow_html=True,
+    )
 
-        st.markdown("**Note:** SEGY analysis requires `segyio` and domain-specific visualizations. This is a placeholder page.")
+    segy_dir = Path("data/segy")
+    file_index = build_segy_file_index(segy_dir)
+    available_events = sorted({event_id for event_id, _ in file_index})
+    well_options = [f"CRC-{well_id}" for well_id in range(3, 8)]
+    if not available_events:
+        st.warning("No SEGY files were found in data/segy.", icon=":material/warning:")
+    else:
+        with st.container(border=True):
+            event_col, well_col, channel_col = st.columns([1, 1, 1.2])
+            with event_col:
+                event_id = st.selectbox("Event ID", available_events, format_func=lambda value: f"Event {value}")
+            available_wells = [well for event, well in file_index if event == event_id]
+            with well_col:
+                well = st.selectbox("Recording well", well_options, index=well_options.index(available_wells[0]) if available_wells else 0)
+            selected_path = file_index.get((event_id, well))
+            event = EVENT_CATALOG.get(event_id, {})
+            with channel_col:
+                channel_hint = st.number_input("Channel selector", min_value=1, value=121, step=1)
+            if selected_path is None:
+                st.info(f"No file is available for Event {event_id} in {well}. Available wells: {', '.join(available_wells) or 'none'}.", icon=":material/info:")
+            else:
+                st.caption(f"Loaded automatically: `{selected_path.name}`")
+
+        if selected_path is not None:
+            try:
+                bundle = load_segy_file(str(selected_path))
+            except Exception as exc:
+                st.error(f"Could not read {selected_path.name}: {exc}", icon=":material/error:")
+            else:
+                traces = bundle["traces"]
+                trace_count = bundle["trace_count"]
+                channel = min(int(channel_hint), trace_count)
+                samples_ms = bundle["samples"] / 1000.0
+                sample_rate_hz = 1_000_000.0 / bundle["sample_interval_us"]
+                raw_trace = traces[channel - 1].astype(float)
+                duration_s = len(raw_trace) / sample_rate_hz
+
+                with st.sidebar:
+                    st.subheader("Signal controls")
+                    low_hz = st.number_input("Bandpass low (Hz)", min_value=0.0, max_value=float(sample_rate_hz / 2), value=5.0, step=5.0)
+                    high_default = min(450.0, sample_rate_hz / 2 - 1)
+                    high_hz = st.number_input("Bandpass high (Hz)", min_value=1.0, max_value=float(sample_rate_hz / 2), value=high_default, step=5.0)
+                    clip_percentile = st.slider("Heatmap amplitude clip", 90, 100, 99, 1, format="%dth percentile")
+                    heatmap_stride = st.slider("Heatmap time stride", 1, 10, 4)
+
+                if high_hz <= low_hz:
+                    high_hz = min(sample_rate_hz / 2, low_hz + 1)
+                filtered_trace = apply_fft_bandpass(raw_trace, sample_rate_hz, low_hz, high_hz)
+                frequencies, spectrum = get_fft_spectrum(raw_trace, sample_rate_hz)
+                useful_spectrum = spectrum.copy()
+                useful_spectrum[frequencies < max(low_hz, 1)] = 0
+                dominant_frequency = float(frequencies[np.argmax(useful_spectrum)]) if len(useful_spectrum) else float("nan")
+                signal_rms = float(np.sqrt(np.mean(np.square(filtered_trace, dtype=np.float64))))
+                peak_amplitude = float(np.max(np.abs(raw_trace)))
+                noise_window = raw_trace[:max(1, int(raw_trace.size * 0.1))]
+                noise_rms = float(np.sqrt(np.mean(np.square(noise_window, dtype=np.float64))))
+                snr_db = 20 * np.log10(max(signal_rms, 1e-12) / max(noise_rms, 1e-12))
+                all_rms = np.sqrt(np.mean(np.square(traces, dtype=np.float64), axis=1))
+                rms_z = (all_rms[channel - 1] - np.mean(all_rms)) / max(np.std(all_rms), 1e-12)
+
+                def catalog_value(key, suffix=""):
+                    value = event.get(key)
+                    return "N/A" if value is None else f"{value}{suffix}"
+
+                st.subheader(f"Event {event_id} · {well} · channel {channel}")
+                kpi_cols = st.columns(6)
+                kpi_cols[0].metric("Event ID", str(event_id), border=True)
+                kpi_cols[1].metric("Magnitude", catalog_value("magnitude"), border=True)
+                kpi_cols[2].metric("Depth", catalog_value("depth", " m"), border=True)
+                kpi_cols[3].metric("Corner frequency", catalog_value("corner", " Hz"), border=True)
+                kpi_cols[4].metric("Date / time", event.get("date", "N/A"), border=True)
+                kpi_cols[5].metric("UTM East / North", f"{event.get('easting', 'N/A')} / {event.get('northing', 'N/A')}", border=True)
+
+                map_col, timeline_col = st.columns(2)
+                catalog_df = pd.DataFrame([{"event_id": event_number, **metadata} for event_number, metadata in EVENT_CATALOG.items()])
+                catalog_df["date_time"] = pd.to_datetime(catalog_df["date"])
+                catalog_df["selected"] = catalog_df["event_id"].eq(event_id)
+                catalog_df["magnitude_size"] = catalog_df["magnitude"].abs().fillna(0.3) + 0.3
+                with map_col:
+                    map_fig = px.scatter(catalog_df, x="easting", y="northing", size="depth", color="selected", hover_name="event_id", hover_data=["date", "depth", "magnitude"], color_discrete_map={True: "#f0a35b", False: "#70d7bf"}, title="Event locations · UTM zone 54H")
+                    map_fig.update_traces(marker_line_width=1.5, marker_line_color="#f2f8f6")
+                    map_fig.update_layout(xaxis_title="UTM East (m)", yaxis_title="UTM North (m)")
+                    style_segy_figure(map_fig, 360)
+                    st.plotly_chart(map_fig, width="stretch")
+                with timeline_col:
+                    timeline_fig = px.scatter(catalog_df, x="date_time", y="depth", size="magnitude_size", color="selected", hover_name="event_id", color_discrete_map={True: "#f0a35b", False: "#70d7bf"}, title="Microseismic event timeline")
+                    timeline_fig.update_yaxes(autorange="reversed", title="Depth (m)")
+                    timeline_fig.update_xaxes(title="UTC date")
+                    style_segy_figure(timeline_fig, 360)
+                    st.plotly_chart(timeline_fig, width="stretch")
+
+                waveform_col, spectrum_col = st.columns([1.35, 1])
+                with waveform_col:
+                    waveform_fig = go.Figure()
+                    waveform_fig.add_trace(go.Scatter(x=samples_ms, y=raw_trace, name="Raw", line=dict(color="#91aab1", width=1)))
+                    waveform_fig.add_trace(go.Scatter(x=samples_ms, y=filtered_trace, name=f"Filtered {low_hz:g}–{high_hz:g} Hz", line=dict(color="#70d7bf", width=1.5)))
+                    waveform_fig.update_layout(title=f"Channel {channel} waveform", xaxis_title="Time (ms)", yaxis_title="Amplitude", legend=dict(orientation="h"))
+                    style_segy_figure(waveform_fig, 390)
+                    st.plotly_chart(waveform_fig, width="stretch")
+                with spectrum_col:
+                    spectrum_fig = go.Figure(go.Scatter(x=frequencies, y=spectrum, name="Amplitude spectrum", line=dict(color="#f0a35b", width=1.5)))
+                    spectrum_fig.add_vline(x=dominant_frequency, line_dash="dash", line_color="#70d7bf", annotation_text=f"Dominant {dominant_frequency:.1f} Hz")
+                    if event.get("corner") is not None:
+                        spectrum_fig.add_vline(x=event["corner"], line_dash="dot", line_color="#ef7c7c", annotation_text=f"Catalogue corner {event['corner']} Hz")
+                    spectrum_fig.update_layout(title="FFT spectrum", xaxis_title="Frequency (Hz)", yaxis_title="Amplitude", xaxis_range=[0, min(sample_rate_hz / 2, max(500, high_hz * 1.2))])
+                    style_segy_figure(spectrum_fig, 390)
+                    st.plotly_chart(spectrum_fig, width="stretch")
+
+                analysis_cols = st.columns(4)
+                analysis_cols[0].metric("Sampling rate", f"{sample_rate_hz:,.0f} Hz", border=True)
+                analysis_cols[1].metric("Duration", f"{duration_s:.2f} s", border=True)
+                analysis_cols[2].metric("SNR estimate", f"{snr_db:.1f} dB", border=True)
+                analysis_cols[3].metric("Channel RMS z-score", f"{rms_z:+.2f}", border=True)
+
+                st.subheader("DAS channel response")
+                channel_range = st.slider("DAS channel range", 1, trace_count, (1, trace_count))
+                selected_traces = traces[channel_range[0] - 1:channel_range[1], ::heatmap_stride]
+                clipped = max(float(np.nanpercentile(np.abs(selected_traces), clip_percentile)), 1e-8)
+                das_fig = go.Figure(go.Heatmap(x=samples_ms[::heatmap_stride], y=np.arange(channel_range[0], channel_range[1] + 1), z=selected_traces, zmin=-clipped, zmax=clipped, colorscale=[[0, "#123d58"], [0.5, "#081116"], [1, "#f0a35b"]], colorbar=dict(title="amplitude", thickness=12), hovertemplate="Channel %{y}<br>Time %{x:.0f} ms<br>Amplitude %{z:.2f}<extra></extra>"))
+                das_fig.update_layout(title="Channel vs time amplitude image", xaxis_title="Time (ms)", yaxis_title="DAS channel")
+                style_segy_figure(das_fig, 480)
+                st.plotly_chart(das_fig, width="stretch")
+
+                compare_col, insight_col = st.columns([1.3, 1])
+                with compare_col:
+                    st.subheader("Event comparison")
+                    comparison_df = catalog_df.dropna(subset=["magnitude"])
+                    comparison_tabs = st.tabs(["Magnitude vs depth", "Magnitude vs corner frequency"])
+                    with comparison_tabs[0]:
+                        comparison_fig = px.scatter(comparison_df, x="depth", y="magnitude", size="corner", color="event_id", hover_name="event_id", title="Catalogued magnitude and depth")
+                        comparison_fig.add_trace(go.Scatter(x=[event.get("depth")], y=[event.get("magnitude")], mode="markers", marker=dict(size=16, color="#f0a35b", symbol="star"), name="Selected event"))
+                        style_segy_figure(comparison_fig, 350)
+                        st.plotly_chart(comparison_fig, width="stretch")
+                    with comparison_tabs[1]:
+                        corner_df = comparison_df.dropna(subset=["corner"])
+                        corner_fig = px.scatter(corner_df, x="corner", y="magnitude", size="depth", color="event_id", hover_name="event_id", title="Catalogued magnitude and corner frequency")
+                        style_segy_figure(corner_fig, 350)
+                        st.plotly_chart(corner_fig, width="stretch")
+                with insight_col:
+                    st.subheader("Analytical insights")
+                    quality = "strong" if snr_db >= 10 else "moderate" if snr_db >= 3 else "limited"
+                    anomaly = "unusually energetic" if abs(rms_z) >= 2 else "within the channel energy distribution"
+                    st.markdown(f"**Signal quality:** {quality} by the simple first-10%-window SNR estimate ({snr_db:.1f} dB).")
+                    st.markdown(f"**Channel behavior:** channel {channel} is {anomaly} (RMS z-score {rms_z:+.2f}).")
+                    if event.get("corner") is not None:
+                        difference = dominant_frequency - event["corner"]
+                        st.markdown(f"**Frequency check:** the measured spectral peak is {dominant_frequency:.1f} Hz; it differs from the catalogue corner frequency by {difference:+.1f} Hz. These are distinct quantities.")
+                    else:
+                        st.markdown(f"**Frequency check:** the measured spectral peak is {dominant_frequency:.1f} Hz; no catalogue corner frequency is available for this event.")
+                    st.caption("These indicators describe the recorded signal only. They do not establish CO₂ leakage or other geological conclusions.")
+
+                with st.expander("SEGY metadata and trace headers", icon=":material/description:"):
+                    metadata_df = pd.DataFrame({"Field": ["Filename", "Number of traces", "Samples per trace", "Sampling interval", "Sampling rate", "Selected channel", "Depth context"], "Value": [selected_path.name, trace_count, len(bundle["samples"]), f"{bundle['sample_interval_us']:g} μs", f"{sample_rate_hz:,.0f} Hz", channel, f"Event catalogue depth: {event.get('depth', 'N/A')} m; channel depth is not encoded in the available headers"]})
+                    metadata_df["Value"] = metadata_df["Value"].astype(str)
+                    st.dataframe(metadata_df, hide_index=True, width="stretch")
+                    with segyio.open(str(selected_path), "r", ignore_geometry=True) as segy_file:
+                        header = segy_file.header[channel - 1]
+                        header_fields = {"TRACE_SEQUENCE_FILE": segyio.TraceField.TRACE_SEQUENCE_FILE, "TRACE_SEQUENCE_LINE": segyio.TraceField.TRACE_SEQUENCE_LINE, "FieldRecord": segyio.TraceField.FieldRecord, "TraceNumber": segyio.TraceField.TraceNumber, "CDP": segyio.TraceField.CDP, "CDP_TRACE": segyio.TraceField.CDP_TRACE, "GroupX": segyio.TraceField.GroupX, "GroupY": segyio.TraceField.GroupY, "SourceX": segyio.TraceField.SourceX, "SourceY": segyio.TraceField.SourceY, "DelayRecordingTime": segyio.TraceField.DelayRecordingTime, "TRACE_SAMPLE_INTERVAL": segyio.TraceField.TRACE_SAMPLE_INTERVAL}
+                        headers_df = pd.DataFrame({"Header": list(header_fields), "Value": [int(header[field]) for field in header_fields.values()]})
+                    st.dataframe(headers_df, hide_index=True, width="stretch")
