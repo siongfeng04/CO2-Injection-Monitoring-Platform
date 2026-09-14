@@ -46,6 +46,17 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 python scripts/ingest_excel.py path/to/excel.xlsx
 ```
 
+Import the `Full` sheet from the bundled workbook into PostgreSQL `fulldata`:
+
+```powershell
+python scripts/ingest_fulldata.py
+```
+
+The Prediction page calls `GET /api/prediction` to reproduce the notebook workflow
+for corrected bottom-hole pressure and bottom-hole temperature. It compares Linear
+Regression, Random Forest, and Gradient Boosting, then displays the selected model's
+metrics, residuals, actual-vs-predicted charts, time-series chart, and feature importance.
+
 API endpoints
 
 - `GET /api/health` — verify database connectivity.

@@ -13,6 +13,9 @@ from app.crud import (
 )
 from app.services.analysis import compute_kpis, detect_anomalies
 from app.services import excel_source
+from app.services.fulldata import import_full_data, latest_operating_conditions
+from app.services import prediction as prediction_service
+from app.services.prediction import analyze_fulldata
 import tempfile
 from fastapi.responses import JSONResponse
 from datetime import datetime
@@ -30,6 +33,37 @@ def root():
 def health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
     return {"status": "ok", "database": "connected"}
+
+
+@router.post("/ingest-fulldata")
+def ingest_fulldata(db: Session = Depends(get_db)):
+    try:
+        inserted = import_full_data(db)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"inserted": inserted, "table": "fulldata"}
+
+
+@router.get("/prediction")
+def prediction(db: Session = Depends(get_db)):
+    try:
+        return analyze_fulldata(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/injection-optimization")
+def injection_optimization(payload: dict, db: Session = Depends(get_db)):
+    try:
+        return prediction_service.optimize_injection(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/injection-optimization/defaults")
+def injection_optimization_defaults(db: Session = Depends(get_db)):
+    conditions = latest_operating_conditions(db)
+    return {"conditions": conditions}
 
 
 def _full_data_row(row):

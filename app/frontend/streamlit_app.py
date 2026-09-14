@@ -39,7 +39,13 @@ def api_post(path: str, json=None, params=None, timeout=30):
         resp.raise_for_status()
         return resp.json()
     except RequestException as e:
-        st.error(f"API request failed: {e}")
+        detail = None
+        if getattr(e, "response", None) is not None:
+            try:
+                detail = e.response.json().get("detail")
+            except ValueError:
+                detail = None
+        st.error(f"API request failed: {detail or e}")
         return None
 
 
@@ -220,7 +226,7 @@ else:
     if "page" in st.session_state:
         default_page = st.session_state["page"]
 
-nav_options = ["Overview", "Prediction", "Anomaly Detection", "SEGY Analysis"]
+nav_options = ["Overview", "Prediction", "Injection Optimization Simulator", "Anomaly Detection", "SEGY Analysis"]
 try:
     default_index = nav_options.index(default_page)
 except Exception:
@@ -418,6 +424,48 @@ elif page == "Prediction":
         prediction_df = pd.DataFrame((prediction_response or {}).get("timeseries", []))
         if not prediction_df.empty:
             prediction_df["date_time"] = pd.to_datetime(prediction_df["timestamp"])
+
+            # Show the latest predicted parameters using the same status cards as Overview.
+            prediction_df = prediction_df.sort_values("date_time")
+            pressure_values = pd.to_numeric(
+                prediction_df["corrected_bottom_hole_pressure"], errors="coerce"
+            ).dropna()
+            temperature_values = pd.to_numeric(prediction_df["bht"], errors="coerce").dropna()
+            if not pressure_values.empty and not temperature_values.empty:
+                latest_pressure = float(pressure_values.iloc[-1])
+                latest_temperature = float(temperature_values.iloc[-1])
+                pressure_previous = pressure_values.iloc[max(0, len(pressure_values) - 11):-1]
+                temperature_previous = temperature_values.iloc[max(0, len(temperature_values) - 11):-1]
+                pressure_average = pressure_previous.mean()
+                temperature_average = temperature_previous.mean()
+                pressure_trend = ((latest_pressure - pressure_average) / pressure_average * 100) if pressure_average else 0
+                temperature_trend = ((latest_temperature - temperature_average) / temperature_average * 100) if temperature_average else 0
+
+                st.subheader("Current Status")
+                status_col1, status_col2 = st.columns(2)
+                with status_col1:
+                    metric_card(
+                        label="Corrected Bottom-Hole Pressure",
+                        value=latest_pressure,
+                        unit="PSI",
+                        color="#0078D4",
+                        icon="📊",
+                        trend=pressure_trend,
+                        min_val=float(pressure_values.min()),
+                        max_val=float(pressure_values.max()),
+                    )
+                with status_col2:
+                    metric_card(
+                        label="Bottom-Hole Temperature",
+                        value=latest_temperature,
+                        unit="°C",
+                        color="#FF6B6B",
+                        icon="🌡️",
+                        trend=temperature_trend,
+                        min_val=float(temperature_values.min()),
+                        max_val=float(temperature_values.max()),
+                    )
+
             chart_col1, chart_col2 = st.columns(2)
 
             with chart_col1:
@@ -444,6 +492,89 @@ elif page == "Prediction":
                 st.plotly_chart(bottom_temperature_fig, use_container_width=True)
         else:
             st.info("No fulldata records are available for this period.")
+
+    st.header("Notebook Prediction Analysis")
+    prediction_action_col, prediction_status_col = st.columns([1, 2])
+    with prediction_action_col:
+        if "prediction_analysis" not in st.session_state:
+            with st.spinner("Training pressure and temperature models..."):
+                analysis_response = api_get("/api/prediction", timeout=120)
+            if analysis_response is not None:
+                st.session_state["prediction_analysis"] = analysis_response
+        if st.button("Import Full Data to PostgreSQL"):
+            with st.spinner("Importing the Full sheet into fulldata..."):
+                ingest_response = api_post("/api/ingest-fulldata", timeout=120)
+            if ingest_response is not None:
+                st.success(f"Imported {ingest_response.get('inserted', 0):,} rows")
+    with prediction_status_col:
+        prediction_analysis = st.session_state.get("prediction_analysis")
+        if prediction_analysis:
+            st.caption(
+                f"Trained on {prediction_analysis.get('row_count', 0):,} active recording rows "
+                "from PostgreSQL fulldata."
+            )
+
+    prediction_analysis = st.session_state.get("prediction_analysis")
+    if prediction_analysis:
+        for target_key, target_data in (
+            ("pressure", prediction_analysis.get("pressure", {})),
+            ("temperature", prediction_analysis.get("temperature", {})),
+        ):
+            st.subheader(target_data.get("label", target_key.title()))
+            st.write(f"Selected model: **{target_data.get('best_model', 'Unavailable')}**")
+            metrics_df = pd.DataFrame(target_data.get("metrics", {})).T
+            if not metrics_df.empty:
+                metrics_df.index.name = "Model"
+                st.dataframe(metrics_df, use_container_width=True)
+
+            test_df = pd.DataFrame(target_data.get("test_predictions", []))
+            importance_df = pd.DataFrame(target_data.get("feature_importance", []))
+            if test_df.empty:
+                st.warning("No test predictions were returned for this target.")
+                continue
+
+            test_df["timestamp"] = pd.to_datetime(test_df["timestamp"])
+            with st.expander("Prediction results table"):
+                st.dataframe(test_df, use_container_width=True)
+            chart_col1, chart_col2 = st.columns(2)
+            with chart_col1:
+                actual_predicted_fig = px.scatter(
+                    test_df,
+                    x="actual",
+                    y="predicted",
+                    title=f"{target_data.get('label')}: Actual vs Predicted",
+                    labels={"actual": "Actual", "predicted": "Predicted"},
+                )
+                st.plotly_chart(actual_predicted_fig, use_container_width=True)
+            with chart_col2:
+                residual_fig = px.histogram(
+                    test_df,
+                    x="residual",
+                    nbins=50,
+                    title=f"{target_data.get('label')}: Residual Distribution",
+                    labels={"residual": "Residual (actual - predicted)"},
+                )
+                st.plotly_chart(residual_fig, use_container_width=True)
+
+            time_fig = px.line(
+                test_df,
+                x="timestamp",
+                y=["actual", "predicted"],
+                title=f"{target_data.get('label')}: Actual vs Predicted Over Time",
+                labels={"value": target_data.get("label"), "timestamp": "Date and time"},
+            )
+            st.plotly_chart(time_fig, use_container_width=True)
+
+            if not importance_df.empty:
+                importance_fig = px.bar(
+                    importance_df.sort_values("importance"),
+                    x="importance",
+                    y="feature",
+                    orientation="h",
+                    title=f"Feature Importance: {target_data.get('label')}",
+                    labels={"importance": "Importance", "feature": "Feature"},
+                )
+                st.plotly_chart(importance_fig, use_container_width=True)
 
     prediction_controls, prediction_results = st.columns([1, 1])
 
@@ -516,6 +647,138 @@ elif page == "Prediction":
             sdf["timestamp"] = pd.to_datetime(sdf["timestamp"])
             fig2 = px.line(sdf, x="timestamp", y="predicted_bhp", title="What-if Predicted BHP")
             st.plotly_chart(fig2, use_container_width=True)
+
+elif page == "Injection Optimization Simulator":
+    st.header("Injection Optimization Simulator")
+    st.write("Use the trained CBHP and BHT models to test operating limits before injection.")
+
+    default_conditions_response = api_get("/api/injection-optimization/defaults", timeout=30)
+    default_conditions = (default_conditions_response or {}).get("conditions") or {}
+    if default_conditions:
+        st.caption(f"Operating-condition defaults loaded from database row: {default_conditions.get('timestamp', 'latest')}")
+    else:
+        st.warning("No database row contains nonzero values for all operating-condition inputs. Using zero defaults.")
+
+    mode_labels = {
+        "Maximum Injection": "maximum_injection",
+        "Safe Operation": "safe_operation",
+        "Temperature Control": "temperature_control",
+    }
+    selected_mode = st.segmented_control("Optimization mode", list(mode_labels), default="Maximum Injection")
+    mode = mode_labels[selected_mode]
+
+    with st.container(border=True):
+        st.subheader("Operating conditions")
+        input_col1, input_col2, input_col3 = st.columns(3)
+        with input_col1:
+            surface_psi = st.number_input("Surface PSI", value=float(default_conditions.get("surface_psi", 0.0)), key="optimizer_surface_psi")
+            annulus_psi = st.number_input("Annulus PSI", value=float(default_conditions.get("annulus_psi", 0.0)), key="optimizer_annulus_psi")
+            pump_speed = st.number_input("Pump speed", value=float(default_conditions.get("pump_speed", 0.0)), key="optimizer_pump_speed")
+        with input_col2:
+            surface_temp = st.number_input("Surface temperature", value=float(default_conditions.get("surface_temp", 0.0)), key="optimizer_surface_temp")
+            temperature_before_triplex = st.number_input("Temperature before Triplex", value=float(default_conditions.get("temperature_before_triplex", 0.0)), key="optimizer_triplex_temp")
+        with input_col3:
+            pressure_before_triplex = st.number_input("Pressure before Triplex", value=float(default_conditions.get("pressure_before_triplex", 0.0)), key="optimizer_triplex_pressure")
+            flow_min = st.number_input("Search flow minimum (BPM)", min_value=0.0, value=0.0, key="optimizer_flow_min")
+            flow_max = st.number_input("Search flow maximum (BPM)", min_value=0.01, value=100.0, key="optimizer_flow_max")
+            flow_step = st.number_input("Search step (BPM)", min_value=0.01, value=1.0, key="optimizer_flow_step")
+
+    with st.container(border=True):
+        st.subheader("Safety target")
+        target_col, action_col = st.columns([1, 2])
+        with target_col:
+            if mode == "maximum_injection":
+                limit = st.number_input("Maximum allowable CBHP (psi)", value=2200.0, key="optimizer_cbhp_limit_maximum")
+            elif mode == "safe_operation":
+                limit = st.number_input("Maximum allowable CBHP (psi)", value=2200.0, key="optimizer_cbhp_limit_safe")
+                safety_margin_pct = st.number_input(
+                    "Target safety margin (%)",
+                    min_value=0.0,
+                    max_value=99.99,
+                    value=10.0,
+                    step=0.5,
+                    key="optimizer_safety_margin",
+                )
+                st.caption(f"Safe operating limit: {limit * (1 - safety_margin_pct / 100):.2f} psi")
+            else:
+                limit = st.number_input("Maximum allowable BHT (°C)", value=95.0, key="optimizer_bht_limit")
+        with action_col:
+            st.caption("The optimizer evaluates the selected flow range using the existing Prediction models.")
+            run_optimizer = st.button("Run optimization", type="primary", key="optimizer_run")
+
+    if run_optimizer:
+        if flow_max < flow_min:
+            st.error("Search flow maximum must be greater than or equal to the minimum.")
+        else:
+            payload = {
+                "mode": mode,
+                "inputs": {
+                    "surface_psi": surface_psi,
+                    "annulus_psi": annulus_psi,
+                    "pump_speed": pump_speed,
+                    "surface_temp": surface_temp,
+                    "temperature_before_triplex": temperature_before_triplex,
+                    "pressure_before_triplex": pressure_before_triplex,
+                },
+                "flow_min": flow_min,
+                "flow_max": flow_max,
+                "flow_step": flow_step,
+            }
+            if mode in {"maximum_injection", "safe_operation"}:
+                payload["cbhp_limit"] = limit
+                if mode == "safe_operation":
+                    payload["safety_margin_pct"] = safety_margin_pct
+            else:
+                payload["bht_limit"] = limit
+            with st.spinner("Evaluating operating conditions..."):
+                optimizer_response = api_post("/api/injection-optimization", json=payload, timeout=120)
+            if optimizer_response is not None:
+                st.session_state["optimizer_response"] = optimizer_response
+
+    result = st.session_state.get("optimizer_response")
+    if result and result.get("mode") == mode:
+        if mode == "temperature_control" and not result.get("feasible", True):
+            closest = result["closest_result"]
+            st.warning(
+                f"No flow in the selected range satisfies the BHT limit of {result['bht_limit']:.2f} °C. "
+                f"The closest result is {closest['predicted_bht']:.2f} °C at {closest['flow_bpm']:.2f} BPM."
+            )
+            result_col1, result_col2 = st.columns(2)
+            result_col1.metric("Closest flow", f"{closest['flow_bpm']:.2f} BPM")
+            result_col2.metric("Closest predicted BHT", f"{closest['predicted_bht']:.2f} °C")
+        elif mode == "maximum_injection":
+            result_col1, result_col2, result_col3 = st.columns(3)
+            result_col1.metric("Recommended flow", f"{result['recommended_flow_bpm']:.2f} BPM")
+            result_col2.metric("Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
+            result_col3.metric("Predicted BHT", f"{result['predicted_bht']:.2f} °C")
+        elif mode == "safe_operation":
+            result_col1, result_col2, result_col3 = st.columns(3)
+            result_col1.metric("Maximum safe flow", f"{result['recommended_flow_bpm']:.2f} BPM")
+            result_col2.metric("Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
+            result_col3.metric("Remaining pressure margin", f"{result['remaining_pressure_margin']:.2f} psi")
+            st.caption(
+                f"Safe operating limit: {result['safe_operating_limit']:.2f} psi "
+                f"({result['safety_margin_pct']:.2f}% below the {result['maximum_allowable_cbhp']:.2f} psi maximum)."
+            )
+        else:
+            acceptable_df = pd.DataFrame(result["acceptable_results"])
+            result_col1, result_col2, result_col3 = st.columns(3)
+            result_col1.metric("Acceptable flow range", f"{result['acceptable_flow_min_bpm']:.2f} - {result['acceptable_flow_max_bpm']:.2f} BPM")
+            result_col2.metric("CBHP range", f"{acceptable_df['predicted_cbhp'].min():.2f} - {acceptable_df['predicted_cbhp'].max():.2f} psi")
+            result_col3.metric("BHT limit", f"{result['bht_limit']:.2f} °C")
+            chart = px.line(
+                acceptable_df,
+                x="flow_bpm",
+                y=["predicted_cbhp", "predicted_bht"],
+                markers=True,
+                title="Acceptable operating conditions",
+                labels={"flow_bpm": "Flow (BPM)", "value": "Predicted value"},
+            )
+            st.plotly_chart(chart, width="stretch")
+            st.dataframe(acceptable_df, hide_index=True, width="stretch")
+        st.caption(f"CBHP model: {result['models']['cbhp']} | BHT model: {result['models']['bht']}")
+    elif not result:
+        st.info("Enter operating conditions and run an optimization mode to see recommendations.")
 
 elif page == "Anomaly Detection":
     with col1:

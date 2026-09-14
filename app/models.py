@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Time
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -31,10 +31,17 @@ class FullData(Base):
     __tablename__ = "fulldata"
 
     timestamp = Column("date_time", DateTime, primary_key=True, index=True)
+    injection_date = Column(Date, nullable=True)
+    injection_time = Column(Time, nullable=True)
     surface_temp = Column("surface_temperature", Float, nullable=True)
     surface_psi = Column(Float, nullable=True)
     annulus_psi = Column(Float, nullable=True)
+    flowrate_meter = Column(Float, nullable=True)
     pump_speed = Column(Float, nullable=True)
+    calc_flow_from_pump_speed = Column(Float, nullable=True)
+    flow_bpm = Column(Float, nullable=True)
+    temperature_before_triplex = Column(Float, nullable=True)
+    pressure_before_triplex = Column(Float, nullable=True)
     bhp = Column("bottom_hole_pressure", Float, nullable=True)
     corrected_bhp = Column("corrected_bottom_hole_pressure", Float, nullable=True)
     bht = Column("bottom_hole_temperature", Float, nullable=True)
