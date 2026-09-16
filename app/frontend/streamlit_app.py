@@ -79,6 +79,10 @@ def get_current_data(file_path="data/excel/combined_co2_data_only_file.xls", she
             "surface_temp": row.get("surface_temp"),
             "surface_psi": row.get("surface_psi"),
             "annulus_psi": row.get("annulus_psi"),
+            "flow_bpm": row.get("flow_bpm"),
+            "bhp": row.get("bhp"),
+            "corrected_bottom_hole_pressure": row.get("corrected_bottom_hole_pressure"),
+            "bht": row.get("bht"),
         }
     except Exception as e:
         st.error(f"Error reading Excel data: {e}")
@@ -125,6 +129,93 @@ def metric_card(label: str, value: float, unit: str = "", color: str = "#0078D4"
         
         with col_icon:
             st.markdown(f"<p style='font-size: 36px; margin: 0; text-align: center;'>{icon}</p>", unsafe_allow_html=True)
+
+
+def render_digital_twin(current_data: dict, flow_bpm=None):
+    def display_value(value, unit="", decimals=0):
+        if value is None or pd.isna(value):
+            return "N/A"
+        return f"{float(value):,.{decimals}f} {unit}".strip()
+
+    surface_psi = display_value(current_data.get("surface_psi"), "PSI")
+    surface_temp = display_value(current_data.get("surface_temp"), "°F", 1)
+    annulus_psi = display_value(current_data.get("annulus_psi"), "PSI")
+    bottom_pressure = display_value(
+        current_data.get("corrected_bottom_hole_pressure") or current_data.get("bhp"), "PSI"
+    )
+    bottom_temperature = display_value(current_data.get("bht"), "°C", 1)
+    flow = display_value(flow_bpm, "BPM", 2)
+
+    st.markdown(
+        f"""
+        <style>
+        .digital-twin {{
+            position: relative; overflow: hidden; min-height: 430px; margin: .35rem 0 1.25rem;
+            border: 1px solid #1c3345; border-radius: 12px; background: #060b1e;
+            color: #d9e9f2; font-family: 'IBM Plex Mono', 'Cascadia Code', monospace;
+        }}
+        .digital-twin::before {{
+            content: ''; position: absolute; inset: 0; opacity: .36;
+            background: linear-gradient(rgba(65, 105, 135, .12) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(65, 105, 135, .10) 1px, transparent 1px);
+            background-size: 32px 32px; pointer-events: none;
+        }}
+        .twin-header, .twin-footer, .twin-stage {{ position: relative; z-index: 1; }}
+        .twin-header {{ display: flex; align-items: center; justify-content: space-between; padding: 1rem 1.25rem .65rem; }}
+        .twin-title {{ color: #edf4ff; font: 700 1.05rem 'IBM Plex Sans', sans-serif; }}
+        .twin-title span {{ color: #15d6c9; }}
+        .twin-flow {{ padding: .42rem .75rem; border: 1px solid #233c59; border-radius: 6px; color: #a9c8ef; background: #0c1930; font-size: .78rem; }}
+        .twin-stage {{ height: 325px; margin: 0 1.25rem; position: relative; }}
+        .twin-surface-line {{ position: absolute; top: 49px; left: 18%; right: 20%; height: 5px; border-radius: 5px; background: #596b86; box-shadow: 0 0 0 1px #263b56; }}
+        .twin-label {{ position: absolute; color: #7b9abc; font-size: .68rem; letter-spacing: .03em; }}
+        .twin-surface {{ top: 30px; left: 18%; }}
+        .twin-formations {{ position: absolute; top: 51px; bottom: 0; left: 20%; width: 60%; background: rgba(25, 35, 60, .7); }}
+        .twin-overburden {{ height: 36%; padding: 1.6rem .7rem; color: #637da4; font-size: .7rem; }}
+        .twin-caprock {{ height: 22%; padding: .9rem .7rem; border-top: 1px dashed #bfc9d8; border-bottom: 1px dashed #bfc9d8; background: rgba(82, 99, 126, .62); color: #f1f4fc; font-size: .7rem; }}
+        .twin-caprock b, .twin-target b {{ display: block; margin-bottom: .35rem; color: #f7fbff; }}
+        .twin-target {{ height: 42%; padding: 1.15rem .7rem; background: rgba(0, 70, 78, .75); color: #98f8ed; font-size: .7rem; }}
+        .twin-well {{ position: absolute; top: 18px; bottom: -4px; left: 48%; width: 42px; border-left: 4px solid #97a7be; border-right: 4px solid #97a7be; background: linear-gradient(90deg, #07867f, #12b9a9 48%, #087d78); box-shadow: 0 0 18px rgba(11, 214, 194, .2); }}
+        .twin-well::before {{ content: ''; position: absolute; top: -2px; left: -18px; width: 70px; height: 31px; border: 2px solid #8293aa; border-radius: 4px; background: #4b5c73; }}
+        .twin-well::after {{ content: ''; position: absolute; top: -11px; left: 12px; width: 14px; height: 14px; border-radius: 50%; background: #10b9ad; }}
+        .twin-sensor {{ position: absolute; left: 17px; width: 7px; height: 7px; border-radius: 50%; background: #d9f5ef; }}
+        .sensor-one {{ top: 66px; }} .sensor-two {{ top: 136px; }} .sensor-three {{ top: 206px; }}
+        .twin-callout {{ position: absolute; padding: .55rem .65rem; border: 1px solid #10d5ce; border-radius: 6px; background: #062b31; color: #75fff4; font-size: .68rem; line-height: 1.45; }}
+        .twin-surface-callout {{ top: 25px; left: 56%; }}
+        .twin-bottom-callout {{ right: 14%; bottom: 8px; }}
+        .twin-annulus {{ top: 111px; left: 23%; color: #f0a62b; }}
+        .twin-annulus::before {{ content: ''; position: absolute; top: 50%; right: -45px; width: 42px; border-top: 2px dotted #f0a62b; }}
+        .twin-footer {{ display: flex; justify-content: space-between; margin: 0 1.25rem; padding: .8rem .35rem 1rem; border-top: 1px solid #1d3046; color: #b4c5db; font: .9rem 'IBM Plex Sans', sans-serif; }}
+        .twin-footer strong {{ color: #14d5ca; }}
+        @media (max-width: 700px) {{
+            .twin-header {{ align-items: flex-start; gap: .7rem; flex-direction: column; }}
+            .twin-stage {{ margin: 0 .5rem; }} .twin-formations {{ left: 8%; width: 84%; }}
+            .twin-surface {{ left: 8%; }} .twin-surface-line {{ left: 8%; right: 8%; }}
+            .twin-surface-callout {{ left: 55%; }} .twin-annulus {{ left: 5%; }} .twin-bottom-callout {{ right: 3%; }}
+            .twin-footer {{ margin: 0 .75rem; font-size: .75rem; }}
+        }}
+        </style>
+        <div class="digital-twin">
+            <div class="twin-header">
+                <div class="twin-title"><span>◉</span>&nbsp; Subsurface profile <span>(TVD: 7,450 ft)</span></div>
+                <div class="twin-flow">Flow: {flow}</div>
+            </div>
+            <div class="twin-stage">
+                <div class="twin-surface-line"></div><div class="twin-label twin-surface">SURFACE&nbsp; (0 ft)</div>
+                <div class="twin-formations">
+                    <div class="twin-overburden">Overburden Shales &amp; Sands</div>
+                    <div class="twin-caprock"><b>PRIMARY CAPROCK SEAL (Eau Claire Shale)</b>Depth: 6,800 - 7,100 ft · P_break: 4,180 PSI</div>
+                    <div class="twin-target"><b>TARGET SALINE FORMATION (Mount Simon Sandstone)</b>Porosity: 18.4% · Perm: 145 mD · Salinity: 120,000 ppm</div>
+                </div>
+                <div class="twin-well"><span class="twin-sensor sensor-one"></span><span class="twin-sensor sensor-two"></span><span class="twin-sensor sensor-three"></span></div>
+                <div class="twin-label twin-annulus">A-Annulus: {annulus_psi}</div>
+                <div class="twin-callout twin-surface-callout">P_surf: <b>{surface_psi}</b><br>T_surf: {surface_temp}</div>
+                <div class="twin-callout twin-bottom-callout">BHP: <b>{bottom_pressure}</b><br>BHT: {bottom_temperature}</div>
+            </div>
+            <div class="twin-footer"><span>Hydrostatic Head: <strong>+1,582 PSI</strong></span><span>Fluid: <strong>Supercritical CO₂</strong></span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def toggle_flow_unit():
@@ -329,6 +420,7 @@ if page == "Overview":
     
     # Display KPIs and timeseries
     st.subheader("Analytics")
+    render_digital_twin(current_data or {})
 
     subset_start, subset_end = get_excel_date_range()
     if subset_start and subset_end:
