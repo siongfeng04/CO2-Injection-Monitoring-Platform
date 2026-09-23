@@ -108,7 +108,7 @@ def metric_card(label: str, value: float, unit: str = "", color: str = "#0078D4"
             trend_color = "#DC3545"  # Red
     
     # Create custom HTML for the card using st.container
-    with st.container(border=True):
+    with st.container(border=True, height=150):
         col_content, col_icon = st.columns([5, 1])
         
         with col_content:
@@ -216,6 +216,71 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_daily_injection_charts(start: str, end: str):
+    response = api_get(
+        "/api/dashboard/metrics",
+        params={"start": f"{start}T00:00:00", "end": f"{end}T23:59:59"},
+        timeout=30,
+    )
+    full_data_df = pd.DataFrame((response or {}).get("timeseries", []))
+    if full_data_df.empty or not {"timestamp", "flow_bpm"}.issubset(full_data_df.columns):
+        st.info("No full-data flow records are available for daily injection charts.")
+        return
+
+    full_data_df["timestamp"] = pd.to_datetime(full_data_df["timestamp"], errors="coerce")
+    full_data_df["flow_bpm"] = pd.to_numeric(full_data_df["flow_bpm"], errors="coerce")
+    full_data_df = full_data_df.dropna(subset=["timestamp", "flow_bpm"])
+    if full_data_df.empty:
+        st.info("No valid full-data flow records are available for daily injection charts.")
+        return
+
+    full_data_df["injected_bbl"] = full_data_df["flow_bpm"] * (10 / 60)
+    daily_injection_df = (
+        full_data_df.assign(day=full_data_df["timestamp"].dt.floor("D"))
+        .groupby("day", as_index=False)["injected_bbl"]
+        .sum()
+        .sort_values("day")
+    )
+    daily_injection_df["cumulative_bbl"] = daily_injection_df["injected_bbl"].cumsum()
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        injected_fig = px.bar(
+            daily_injection_df,
+            x="day",
+            y="injected_bbl",
+            title="CO₂ Injected Per Day",
+            labels={"day": "Day", "injected_bbl": "Injected Volume (bbl/day)"},
+            color_discrete_sequence=["#15d6c9"],
+        )
+        injected_fig.update_traces(
+            hovertemplate="Day: %{x|%Y-%m-%d}<br>Injected volume: %{y:,.2f} bbl/day<extra></extra>"
+        )
+        injected_fig.update_layout(hovermode="x unified")
+        st.plotly_chart(injected_fig, use_container_width=True)
+
+    with chart_col2:
+        cumulative_fig = go.Figure(
+            go.Scatter(
+                x=daily_injection_df["day"],
+                y=daily_injection_df["cumulative_bbl"],
+                mode="lines",
+                name="Cumulative CO₂ stored",
+                line=dict(color="#15d6c9", width=3, shape="spline", smoothing=0.6),
+                fill="tozeroy",
+                fillcolor="rgba(21, 214, 201, 0.22)",
+                hovertemplate="Day: %{x|%Y-%m-%d}<br>Cumulative volume: %{y:,.2f} bbl<extra></extra>",
+            )
+        )
+        cumulative_fig.update_layout(
+            title="Cumulative CO₂ Stored",
+            xaxis_title="Day",
+            yaxis_title="Cumulative Volume (bbl)",
+            hovermode="x unified",
+        )
+        st.plotly_chart(cumulative_fig, use_container_width=True)
 
 
 def toggle_flow_unit():
@@ -375,12 +440,16 @@ if page == "Overview":
             temp_min, temp_max = df['Surface Temp.'].min(), df['Surface Temp.'].max()
             psi_min, psi_max = df['Surface PSI'].min(), df['Surface PSI'].max()
             annulus_min, annulus_max = df['Annulus PSI'].min(), df['Annulus PSI'].max()
+            total_injected_volume = (
+                pd.to_numeric(df['Flow BPM'], errors='coerce').fillna(0).sum() * (10 / 60)
+            )
         except:
             trend_temp = trend_psi = trend_annulus = 0
             temp_min = temp_max = psi_min = psi_max = annulus_min = annulus_max = 0
+            total_injected_volume = 0
         
-        # Create three columns for metric cards
-        card_col1, card_col2, card_col3 = st.columns(3)
+        # Create metric cards
+        card_col1, card_col2, card_col3, card_col4 = st.columns(4)
         
         with card_col1:
             metric_card(
@@ -417,6 +486,15 @@ if page == "Overview":
                 min_val=annulus_min,
                 max_val=annulus_max
             )
+
+        with card_col4:
+            metric_card(
+                label="Total Injected Volume",
+                value=total_injected_volume,
+                unit="bbl",
+                color="#15D6C9",
+                icon="💧"
+            )
     
     # Display KPIs and timeseries
     st.subheader("Analytics")
@@ -424,6 +502,8 @@ if page == "Overview":
 
     subset_start, subset_end = get_excel_date_range()
     if subset_start and subset_end:
+        render_daily_injection_charts(subset_start, subset_end)
+
         if "flow_unit" not in st.session_state:
             st.session_state["flow_unit"] = "flow_bpm"
         st.button(
