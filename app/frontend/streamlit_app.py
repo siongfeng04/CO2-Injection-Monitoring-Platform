@@ -723,6 +723,7 @@ def render_live_monitoring():
         try:
             df = pd.read_excel("data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", engine="xlrd")
             df["Date & Time"] = pd.to_datetime(df["Date & Time"])
+            df = df[df["Date & Time"] <= current_data["timestamp"]]
             current_idx = len(df) - 1
             start_idx = max(0, current_idx - 10)
             if current_idx > start_idx:
