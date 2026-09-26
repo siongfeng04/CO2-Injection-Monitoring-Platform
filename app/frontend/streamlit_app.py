@@ -748,6 +748,20 @@ def render_live_monitoring():
     render_digital_twin(current_data or {})
 
 
+@st.fragment(run_every="1s")
+def render_simulated_clock():
+    simulated_time = get_monitoring_timestamp().strftime("%d %b %Y, %H:%M:%S")
+    st.markdown(
+        f"""
+        <div style='text-align: right; padding: .35rem 0 .15rem; line-height: 1.15;'>
+            <div style='color: #8da0aa; font-size: .72rem; letter-spacing: .04em; text-transform: uppercase;'>Simulated time</div>
+            <div style='color: #f2f7f6; font-size: 1.25rem; font-weight: 600; white-space: nowrap;'>{simulated_time}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 EVENT_CATALOG = {
     2: {"date": "2020-10-29 02:29", "easting": 658631.5, "northing": 5733858, "depth": 1490, "magnitude": -1.0, "corner": 90},
     11: {"date": "2021-02-25 20:23", "easting": 658804.5, "northing": 5733873, "depth": 1510, "magnitude": None, "corner": None},
@@ -802,7 +816,11 @@ col1, col2 = st.columns([1, 3])
 
 if page == "Overview":
     st_autorefresh(interval=60_000, key="overview_refresh")
-    st.header("Dashboard")
+    overview_title_col, clock_col = st.columns([3, 2])
+    with overview_title_col:
+        st.header("Dashboard")
+    with clock_col:
+        render_simulated_clock()
     render_live_monitoring()
 
     subset_start, subset_end = get_excel_date_range()
