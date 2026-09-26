@@ -118,15 +118,20 @@ def call_llm(question, source, context, history=None):
         return None
 
 
-# Excel helper: detect earliest and latest dates from the Dataset_Test sheet
-def get_excel_date_range(file_path="data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", col_name="Date & Time"):
+# Excel helper: detect the source range, optionally capped at simulated time
+def get_excel_date_range(file_path="data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", col_name="Date & Time", end_timestamp=None):
     try:
         df_dates = pd.read_excel(file_path, sheet_name=sheet_name, usecols=[col_name], engine="xlrd")
         dates = pd.to_datetime(df_dates[col_name], errors="coerce")
         dates = dates.dropna()
         if dates.empty:
             return None, None
-        return dates.min().date().isoformat(), dates.max().date().isoformat()
+        available_end = dates.max()
+        if end_timestamp is not None:
+            available_end = min(available_end, pd.to_datetime(end_timestamp))
+        if available_end < dates.min():
+            return None, None
+        return dates.min().date().isoformat(), available_end.isoformat()
     except Exception:
         return None, None
 
@@ -174,6 +179,10 @@ def get_current_data(file_path="data/excel/combined_co2_data_only_file.xls", she
     except Exception as e:
         st.error(f"Error reading Excel data: {e}")
         return None
+
+
+def query_end_timestamp(end: str) -> str:
+    return end if "T" in end else f"{end}T23:59:59"
 
 # Power BI-style interactive metric card
 def metric_card(label: str, value: float, unit: str = "", color: str = "#0078D4", icon: str = "📊", 
@@ -308,7 +317,7 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
 def render_daily_injection_charts(start: str, end: str):
     response = api_get(
         "/api/dashboard/metrics",
-        params={"start": f"{start}T00:00:00", "end": f"{end}T23:59:59"},
+        params={"start": f"{start}T00:00:00", "end": query_end_timestamp(end)},
         timeout=30,
     )
     full_data_df = pd.DataFrame((response or {}).get("timeseries", []))
@@ -823,7 +832,8 @@ if page == "Overview":
         render_simulated_clock()
     render_live_monitoring()
 
-    subset_start, subset_end = get_excel_date_range()
+    simulated_time = get_monitoring_timestamp()
+    subset_start, subset_end = get_excel_date_range(end_timestamp=simulated_time)
     if subset_start and subset_end:
         render_daily_injection_charts(subset_start, subset_end)
 
@@ -840,7 +850,7 @@ if page == "Overview":
                 "/api/dashboard/subset-flow",
                 params={
                     "start": f"{subset_start}T00:00:00",
-                    "end": f"{subset_end}T23:59:59",
+                    "end": query_end_timestamp(subset_end),
                 },
                 timeout=30,
             )
@@ -880,10 +890,10 @@ if page == "Overview":
     
     # Only load metrics on demand with a button
     if st.button("Load Detailed Metrics"):
-        start, end = get_excel_date_range()
+        start, end = get_excel_date_range(end_timestamp=get_monitoring_timestamp())
         if start and end:
             with st.spinner("Loading metrics..."):
-                params = {"start": f"{start}T00:00:00", "end": f"{end}T23:59:59"}
+                params = {"start": f"{start}T00:00:00", "end": query_end_timestamp(end)}
                 resp = api_get("/api/dashboard/metrics", params=params, timeout=30)
                 if resp is not None:
                     st.session_state["metrics"] = resp
