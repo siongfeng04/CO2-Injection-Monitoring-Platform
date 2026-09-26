@@ -9,8 +9,18 @@ import io
 import numpy as np
 import segyio
 from pathlib import Path
+from datetime import date, datetime, timedelta
+import tempfile
+from streamlit_autorefresh import st_autorefresh
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from dotenv import load_dotenv
+
+load_dotenv()
 
 st.set_page_config(page_title="CCS Digital Twin", layout="wide")
+
+MONITORING_CURRENT_TIMESTAMP = "2009-09-25 03:00:01"
 
 st.title("CCS Digital Twin — Injection Monitoring")
 
@@ -49,6 +59,65 @@ def api_post(path: str, json=None, params=None, timeout=30):
         return None
 
 
+def call_llm(question, source, context, history=None):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a precise data assistant for a CCS Digital Twin. "
+                f"The only permitted source for this answer is: {source}. "
+                "Use only the supplied context. Never invent values, units, trends, or facts. "
+                "If the context does not answer the question, say that the information cannot be determined "
+                "from the selected source. Answer naturally and briefly. Mention the data source used."
+            ),
+        }
+    ]
+    if history:
+        messages.extend(
+            {"role": item["role"], "content": item["content"]}
+            for item in history[-6:]
+            if item["role"] in {"user", "assistant"}
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": f"Question: {question}\n\nSelected-source context:\n{context}",
+        }
+    )
+    try:
+        response = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "temperature": 0.2},
+            timeout=45,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        return content.strip() if content else None
+    except (RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
+        if isinstance(exc, RequestException) and exc.response is not None and exc.response.status_code == 429:
+            try:
+                api_error = exc.response.json().get("error", {})
+                error_code = api_error.get("code")
+                error_message = api_error.get("message")
+            except (TypeError, ValueError):
+                error_code = None
+                error_message = None
+            reason = error_message or "OpenAI rate limit or account quota was exceeded."
+            if error_code:
+                reason = f"{reason} ({error_code})"
+            st.warning(f"OpenAI is unavailable; showing the local data response instead. {reason}")
+        else:
+            st.warning(f"LLM API unavailable; showing the local data response instead. ({exc})")
+        return None
+
+
 # Excel helper: detect earliest and latest dates from the Dataset_Test sheet
 def get_excel_date_range(file_path="data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", col_name="Date & Time"):
     try:
@@ -61,21 +130,39 @@ def get_excel_date_range(file_path="data/excel/combined_co2_data_only_file.xls",
     except Exception:
         return None, None
 
+# Simulated monitoring time advances from the requested starting timestamp for each session.
+def get_monitoring_timestamp():
+    if "monitoring_wall_start" not in st.session_state:
+        st.session_state["monitoring_wall_start"] = datetime.now()
+    elapsed = datetime.now() - st.session_state["monitoring_wall_start"]
+    return pd.Timestamp(MONITORING_CURRENT_TIMESTAMP) + pd.Timedelta(elapsed)
+
+
 # Excel helper: get current data at a specific timestamp
-def get_current_data(file_path="data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", timestamp="2009-09-25 07:42:45"):
+def get_current_data(file_path="data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", timestamp=None):
     try:
-        target = pd.to_datetime(timestamp)
-        target = pd.to_datetime(timestamp)
+        if timestamp is None:
+            target = get_monitoring_timestamp()
+        else:
+            target = pd.to_datetime(timestamp)
+        df_dates = pd.read_excel(file_path, sheet_name=sheet_name, usecols=["Date & Time"], engine="xlrd")
+        dates = pd.to_datetime(df_dates["Date & Time"], errors="coerce").dropna()
+        if dates.empty:
+            return None
+        data_target = min(target, dates.max())
         response = api_get(
             "/api/dashboard/metrics",
-            params={"start": target.isoformat(), "end": target.isoformat()},
+            params={
+                "start": (data_target - timedelta(minutes=1)).isoformat(),
+                "end": data_target.isoformat(),
+            },
         )
         if not response or not response.get("timeseries"):
             return None
 
         row = response["timeseries"][-1]
         return {
-            "timestamp": pd.to_datetime(row["timestamp"]),
+            "timestamp": target,
             "surface_temp": row.get("surface_temp"),
             "surface_psi": row.get("surface_psi"),
             "annulus_psi": row.get("annulus_psi"),
@@ -336,6 +423,272 @@ def build_segy_file_index(segy_dir):
     return files
 
 
+FULLDATA_CHAT_COLUMNS = {
+    "corrected bottom hole pressure": "corrected_bottom_hole_pressure",
+    "corrected bhp": "corrected_bottom_hole_pressure",
+    "bottom hole pressure": "bottom_hole_pressure",
+    "bhp": "bottom_hole_pressure",
+    "bottom hole temperature": "bottom_hole_temperature",
+    "bht": "bottom_hole_temperature",
+    "surface pressure": "surface_pressure",
+    "surface psi": "surface_pressure",
+    "annulus pressure": "annulus_pressure",
+    "annulus psi": "annulus_pressure",
+    "flowrate": "flow_bpm",
+    "flow rate": "flow_bpm",
+    "flow": "flow_bpm",
+    "pump speed": "pump_speed",
+    "surface temperature": "surface_temperature",
+    "temperature": "surface_temperature",
+    "flowrate meter": "flowrate_meter",
+    "calculated flow": "calc_flow_from_pump_speed",
+    "temperature before triplex": "temperature_before_triplex",
+    "pressure before triplex": "pressure_before_triplex",
+}
+
+FULLDATA_CHAT_LABELS = {
+    "corrected_bottom_hole_pressure": "Corrected Bottom-Hole Pressure (PSI)",
+    "bottom_hole_pressure": "Bottom-Hole Pressure (PSI)",
+    "bottom_hole_temperature": "Bottom-Hole Temperature (°C)",
+    "surface_pressure": "Surface Pressure (PSI)",
+    "annulus_pressure": "Annulus Pressure (PSI)",
+    "flow_bpm": "Flow Rate (BPM)",
+    "pump_speed": "Pump Speed",
+    "surface_temperature": "Surface Temperature (°F)",
+    "flowrate_meter": "Flowrate Meter",
+    "calc_flow_from_pump_speed": "Calculated Flow from Pump Speed",
+    "temperature_before_triplex": "Temperature Before Triplex",
+    "pressure_before_triplex": "Pressure Before Triplex",
+}
+
+CHAT_INTENT_EXAMPLES = {
+    "greeting": [
+        "hi",
+        "hello",
+        "hey there",
+        "good morning",
+        "good afternoon",
+    ],
+    "thanks": [
+        "thanks",
+        "thank you",
+        "that was helpful",
+        "I appreciate your help",
+    ],
+    "help": [
+        "what can I ask",
+        "what questions can I ask",
+        "what should I ask about this data",
+        "can you suggest questions I can ask",
+        "suggest some questions for me",
+        "give me examples of questions",
+        "what can you help me with",
+        "how do I ask questions about the dataset",
+        "why did you not answer my question",
+    ],
+    "data_query": [
+        "what is the average pressure",
+        "show the latest temperature",
+        "what was the maximum flowrate",
+        "plot pressure over time",
+        "compare pressure and pump speed",
+        "how many records are in the table",
+    ],
+}
+
+CHAT_INTENT_VECTORIZER = TfidfVectorizer(
+    lowercase=True,
+    ngram_range=(1, 2),
+    analyzer="char_wb",
+    min_df=1,
+)
+CHAT_INTENT_LABELS = [
+    intent
+    for intent, examples in CHAT_INTENT_EXAMPLES.items()
+    for _ in examples
+]
+CHAT_INTENT_MATRIX = CHAT_INTENT_VECTORIZER.fit_transform(
+    [example for examples in CHAT_INTENT_EXAMPLES.values() for example in examples]
+)
+
+
+def classify_chat_intent(question):
+    question_vector = CHAT_INTENT_VECTORIZER.transform([question.strip()])
+    similarities = cosine_similarity(question_vector, CHAT_INTENT_MATRIX)[0]
+    best_index = int(np.argmax(similarities))
+    best_score = float(similarities[best_index])
+    return CHAT_INTENT_LABELS[best_index] if best_score >= 0.28 else None
+
+
+def chatbot_full_data_columns(question):
+    normalized = question.lower()
+    selected = []
+    for phrase, column in sorted(FULLDATA_CHAT_COLUMNS.items(), key=lambda item: len(item[0]), reverse=True):
+        if phrase in normalized and column not in selected:
+            selected.append(column)
+    if not selected:
+        selected = [
+            "corrected_bottom_hole_pressure",
+            "bottom_hole_temperature",
+            "surface_pressure",
+            "annulus_pressure",
+            "flow_bpm",
+            "pump_speed",
+        ]
+    return selected
+
+
+def render_postgres_chat_answer(question, history=None):
+    chat_intent = classify_chat_intent(question)
+    if chat_intent == "greeting":
+        return (
+            "Hello! I can answer questions using only the PostgreSQL Full Data Table. "
+            "Ask me about pressure, temperature, flowrate, pump speed, trends, averages, or comparisons.",
+            None,
+        )
+    if chat_intent == "thanks":
+        return "You're welcome! Ask another question about the PostgreSQL Full Data Table whenever you are ready.", None
+    if chat_intent == "help":
+        return (
+            "You can ask natural-language questions about the PostgreSQL Full Data Table, for example:\n\n"
+            "- What is the latest corrected bottom-hole pressure?\n"
+            "- What is the average bottom-hole temperature?\n"
+            "- What were the maximum and minimum surface pressures?\n"
+            "- Show the flowrate trend over time.\n"
+            "- Compare flowrate with pump speed.\n"
+            "- Is there a correlation between pressure and temperature?\n"
+            "- How many records are in the table?\n\n"
+            "I will query the PostgreSQL data and say when a requested value is unavailable. "
+            "You can also ask for a trend, comparison, or correlation chart.",
+            None,
+        )
+
+    columns = chatbot_full_data_columns(question)
+    response = api_get(
+        "/api/chat/fulldata",
+        params={
+            "columns": ",".join(columns),
+            "limit": 5000,
+        },
+        timeout=30,
+    )
+    data = pd.DataFrame((response or {}).get("data", []))
+    if data.empty:
+        return "No records are available in the PostgreSQL Full Data Table for that question.", None
+    data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce")
+    requested = [column for column in columns if column in data]
+    numeric = data[requested].apply(pd.to_numeric, errors="coerce")
+    valid = numeric.dropna(how="all")
+    if valid.empty:
+        return f"The PostgreSQL Full Data Table has no numeric values for {', '.join(FULLDATA_CHAT_LABELS.get(column, column) for column in requested)}.", None
+
+    question_lower = question.lower()
+    first_timestamp = data["timestamp"].min()
+    last_timestamp = data["timestamp"].max()
+    range_text = f"{first_timestamp:%Y-%m-%d %H:%M} to {last_timestamp:%Y-%m-%d %H:%M}"
+    chart_requested = any(word in question_lower for word in ["trend", "over time", "time series", "compare", "correlation", "chart", "graph", "plot"])
+    if "correlation" in question_lower and len(requested) >= 2:
+        correlation_data = data[[requested[0], requested[1]]].apply(pd.to_numeric, errors="coerce").dropna()
+        if correlation_data.empty:
+            return "The selected PostgreSQL columns do not contain enough numeric values for a correlation chart.", None
+        chart = px.scatter(correlation_data, x=requested[0], y=requested[1], title=f"{FULLDATA_CHAT_LABELS.get(requested[0], requested[0])} vs {FULLDATA_CHAT_LABELS.get(requested[1], requested[1])}", labels={requested[0]: FULLDATA_CHAT_LABELS.get(requested[0], requested[0]), requested[1]: FULLDATA_CHAT_LABELS.get(requested[1], requested[1])})
+        chart.update_layout(legend_title_text="PostgreSQL - Full Data Table")
+        chart_kind = "correlation"
+    elif chart_requested:
+        trend_data = data[["timestamp", *requested]].copy()
+        trend_data[requested] = trend_data[requested].apply(pd.to_numeric, errors="coerce")
+        trend_data = trend_data.dropna(subset=requested, how="all").melt(
+            id_vars="timestamp",
+            value_vars=requested,
+            var_name="measurement",
+            value_name="value",
+        ).dropna(subset=["value"])
+        if trend_data.empty:
+            return "The selected PostgreSQL columns do not contain numeric values for a trend chart.", None
+        trend_data["measurement"] = trend_data["measurement"].map(
+            lambda column: FULLDATA_CHAT_LABELS.get(column, column)
+        )
+        chart = px.line(trend_data, x="timestamp", y="value", color="measurement", title=f"PostgreSQL Full Data Table trend ({range_text})", labels={"timestamp": "Time", "value": "Measurement", "measurement": "Metric"})
+        chart.update_layout(legend_title_text="Measurement")
+        chart_kind = "time series"
+    else:
+        chart = None
+        chart_kind = None
+
+    summary = ["Data source: PostgreSQL - Full Data Table", f"Records analyzed: {len(data)}", f"Available time range: {range_text}"]
+    if any(word in question_lower for word in ["latest", "current", "now", "last"]):
+        latest_row = data.sort_values("timestamp").iloc[-1]
+        summary.append(f"Latest record: {latest_row['timestamp']:%Y-%m-%d %H:%M:%S}")
+        for column in requested:
+            value = pd.to_numeric(pd.Series([latest_row[column]]), errors="coerce").iloc[0]
+            if pd.notna(value):
+                summary.append(f"{FULLDATA_CHAT_LABELS.get(column, column)}: {value:,.3f}")
+    elif any(word in question_lower for word in ["average", "mean", "avg"]):
+        for column in requested:
+            values = numeric[column].dropna()
+            if not values.empty:
+                summary.append(f"Average {FULLDATA_CHAT_LABELS.get(column, column)}: {values.mean():,.3f}")
+    elif any(word in question_lower for word in ["maximum", "max", "highest", "peak"]):
+        for column in requested:
+            values = numeric[column].dropna()
+            if not values.empty:
+                summary.append(f"Maximum {FULLDATA_CHAT_LABELS.get(column, column)}: {values.max():,.3f}")
+    elif any(word in question_lower for word in ["minimum", "min", "lowest"]):
+        for column in requested:
+            values = numeric[column].dropna()
+            if not values.empty:
+                summary.append(f"Minimum {FULLDATA_CHAT_LABELS.get(column, column)}: {values.min():,.3f}")
+    elif "how many" in question_lower or "count" in question_lower or "number of" in question_lower:
+        summary.append(f"The selected PostgreSQL table query returned {len(data):,} records.")
+    else:
+        for column in requested:
+            values = numeric[column].dropna()
+            if not values.empty:
+                summary.append(f"{FULLDATA_CHAT_LABELS.get(column, column)}: latest {values.iloc[-1]:,.3f}; average {values.mean():,.3f}")
+    if chart_kind:
+        summary.append(f"Generated a {chart_kind} chart from the selected PostgreSQL columns.")
+    local_answer = "\n\n".join(summary)
+    llm_answer = call_llm(
+        question,
+        "PostgreSQL - Full Data Table",
+        local_answer,
+        history=history,
+    )
+    return llm_answer or local_answer, chart
+
+
+def render_segy_chat_answer(question, selected_path, history=None):
+    if selected_path is None:
+        return "No SEGY file is selected. Select an existing file or upload one before asking a question.", None
+    try:
+        bundle = load_segy_file(str(selected_path))
+    except Exception as exc:
+        return f"The selected SEGY file could not be read: {exc}", None
+    traces = bundle["traces"]
+    samples = bundle["samples"]
+    sample_rate_hz = 1_000_000.0 / bundle["sample_interval_us"]
+    question_lower = question.lower()
+    summary = ["Data source: SEGY file only", f"File: {selected_path.name}", f"Traces: {bundle['trace_count']}", f"Samples per trace: {len(samples)}", f"Sampling interval: {bundle['sample_interval_us']:g} microseconds", f"Sampling rate: {sample_rate_hz:,.1f} Hz"]
+    chart = None
+    if any(word in question_lower for word in ["waveform", "trace", "signal", "plot", "chart"]):
+        trace = traces[0]
+        chart = go.Figure(go.Scatter(x=samples / 1000.0, y=trace, name="Trace 1", line=dict(color="#70d7bf")))
+        chart.update_layout(title=f"SEGY waveform: {selected_path.name}", xaxis_title="Time (ms)", yaxis_title="Amplitude", legend_title_text="SEGY file")
+        summary.append("Displayed the first trace waveform. The file does not identify a different trace unless the question specifies one.")
+    elif any(word in question_lower for word in ["frequency", "spectrum", "fft"]):
+        frequencies, amplitude = get_fft_spectrum(traces[0].astype(float), sample_rate_hz)
+        dominant_frequency = float(frequencies[np.argmax(amplitude)]) if len(amplitude) else None
+        if dominant_frequency is None:
+            return "A frequency value cannot be determined from the selected SEGY file.", None
+        summary.append(f"Dominant frequency of the first trace: {dominant_frequency:,.3f} Hz.")
+        chart = px.line(x=frequencies, y=amplitude, title=f"SEGY amplitude spectrum: {selected_path.name}", labels={"x": "Frequency (Hz)", "y": "Amplitude"})
+    elif "metadata" not in question_lower and not any(word in question_lower for word in ["sample", "trace", "channel", "file", "sampling"]):
+        return "The requested information cannot be determined from the selected SEGY data. Ask about metadata, traces, waveforms, sampling, or frequency content.", None
+    local_answer = "\n\n".join(summary)
+    llm_answer = call_llm(question, "SEGY Files", local_answer, history=history)
+    return llm_answer or local_answer, chart
+
+
 def style_segy_figure(fig, height=460):
     fig.update_layout(
         height=height,
@@ -349,6 +702,50 @@ def style_segy_figure(fig, height=460):
     fig.update_xaxes(showgrid=False, zeroline=False, color="#90a5ad")
     fig.update_yaxes(showgrid=True, gridcolor="rgba(164, 194, 201, 0.12)", zeroline=False, color="#90a5ad")
     return fig
+
+
+def render_live_monitoring():
+    current_data = get_current_data()
+    if current_data:
+        update_time = current_data["timestamp"].strftime("%d/%m/%Y %I:%M:%S %p")
+        st.info(f"📊 Dashboard updated at {update_time}")
+        st.subheader("Current Status")
+
+        try:
+            df = pd.read_excel("data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", engine="xlrd")
+            df["Date & Time"] = pd.to_datetime(df["Date & Time"])
+            current_idx = len(df) - 1
+            start_idx = max(0, current_idx - 10)
+            if current_idx > start_idx:
+                prev_avg_temp = df["Surface Temp."].iloc[start_idx:current_idx].mean()
+                prev_avg_psi = df["Surface PSI"].iloc[start_idx:current_idx].mean()
+                prev_avg_annulus = df["Annulus PSI"].iloc[start_idx:current_idx].mean()
+                trend_temp = ((current_data["surface_temp"] - prev_avg_temp) / prev_avg_temp * 100) if prev_avg_temp else 0
+                trend_psi = ((current_data["surface_psi"] - prev_avg_psi) / prev_avg_psi * 100) if prev_avg_psi else 0
+                trend_annulus = ((current_data["annulus_psi"] - prev_avg_annulus) / prev_avg_annulus * 100) if prev_avg_annulus else 0
+            else:
+                trend_temp = trend_psi = trend_annulus = 0
+            temp_min, temp_max = df["Surface Temp."].min(), df["Surface Temp."].max()
+            psi_min, psi_max = df["Surface PSI"].min(), df["Surface PSI"].max()
+            annulus_min, annulus_max = df["Annulus PSI"].min(), df["Annulus PSI"].max()
+            total_injected_volume = pd.to_numeric(df["Flow BPM"], errors="coerce").fillna(0).sum() * (10 / 60)
+        except Exception:
+            trend_temp = trend_psi = trend_annulus = 0
+            temp_min = temp_max = psi_min = psi_max = annulus_min = annulus_max = 0
+            total_injected_volume = 0
+
+        card_col1, card_col2, card_col3, card_col4 = st.columns(4)
+        with card_col1:
+            metric_card("Surface Temperature", current_data["surface_temp"] or 0, "°F", "#FF6B6B", "🌡️", trend=trend_temp, min_val=temp_min, max_val=temp_max)
+        with card_col2:
+            metric_card("Surface Pressure", current_data["surface_psi"] or 0, "PSI", "#0078D4", "📊", trend=trend_psi, min_val=psi_min, max_val=psi_max)
+        with card_col3:
+            metric_card("Annulus Pressure", current_data["annulus_psi"] or 0, "PSI", "#20C997", "⚙️", trend=trend_annulus, min_val=annulus_min, max_val=annulus_max)
+        with card_col4:
+            metric_card("Total Injected Volume", total_injected_volume, "bbl", "#15D6C9", "💧")
+
+    st.subheader("Analytics")
+    render_digital_twin(current_data or {})
 
 
 EVENT_CATALOG = {
@@ -382,7 +779,7 @@ else:
     if "page" in st.session_state:
         default_page = st.session_state["page"]
 
-nav_options = ["Overview", "Prediction", "Injection Optimization Simulator", "Anomaly Detection", "SEGY Analysis"]
+nav_options = ["Overview", "Prediction", "Injection Optimization Simulator", "Anomaly Detection", "SEGY Analysis", "AI Chatbot"]
 try:
     default_index = nav_options.index(default_page)
 except Exception:
@@ -404,101 +801,9 @@ if st.button("Reload data from Excel"):
 col1, col2 = st.columns([1, 3])
 
 if page == "Overview":
+    st_autorefresh(interval=60_000, key="overview_refresh")
     st.header("Dashboard")
-    
-    # Get and display current data
-    current_data = get_current_data()
-    if current_data:
-        # Display update timestamp
-        update_time = current_data["timestamp"].strftime("%d/%m/%Y %I:%M:%S %p")
-        st.info(f"📊 Dashboard updated at {update_time}")
-        
-        # Display metric cards with Power BI style
-        st.subheader("Current Status")
-        
-        # Read Excel to get historical data for trends
-        try:
-            df = pd.read_excel("data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", engine="xlrd")
-            df['Date & Time'] = pd.to_datetime(df['Date & Time'])
-            
-            # Calculate trends (% change from average of last 10 records vs current)
-            current_idx = len(df) - 1
-            start_idx = max(0, current_idx - 10)
-            
-            if current_idx > start_idx:
-                prev_avg_temp = df['Surface Temp.'].iloc[start_idx:current_idx].mean()
-                prev_avg_psi = df['Surface PSI'].iloc[start_idx:current_idx].mean()
-                prev_avg_annulus = df['Annulus PSI'].iloc[start_idx:current_idx].mean()
-                
-                trend_temp = ((current_data['surface_temp'] - prev_avg_temp) / prev_avg_temp * 100) if prev_avg_temp else 0
-                trend_psi = ((current_data['surface_psi'] - prev_avg_psi) / prev_avg_psi * 100) if prev_avg_psi else 0
-                trend_annulus = ((current_data['annulus_psi'] - prev_avg_annulus) / prev_avg_annulus * 100) if prev_avg_annulus else 0
-            else:
-                trend_temp = trend_psi = trend_annulus = 0
-            
-            # Get min/max for range display
-            temp_min, temp_max = df['Surface Temp.'].min(), df['Surface Temp.'].max()
-            psi_min, psi_max = df['Surface PSI'].min(), df['Surface PSI'].max()
-            annulus_min, annulus_max = df['Annulus PSI'].min(), df['Annulus PSI'].max()
-            total_injected_volume = (
-                pd.to_numeric(df['Flow BPM'], errors='coerce').fillna(0).sum() * (10 / 60)
-            )
-        except:
-            trend_temp = trend_psi = trend_annulus = 0
-            temp_min = temp_max = psi_min = psi_max = annulus_min = annulus_max = 0
-            total_injected_volume = 0
-        
-        # Create metric cards
-        card_col1, card_col2, card_col3, card_col4 = st.columns(4)
-        
-        with card_col1:
-            metric_card(
-                label="Surface Temperature",
-                value=current_data['surface_temp'] if current_data['surface_temp'] else 0,
-                unit="°F",
-                color="#FF6B6B",
-                icon="🌡️",
-                trend=trend_temp,
-                min_val=temp_min,
-                max_val=temp_max
-            )
-        
-        with card_col2:
-            metric_card(
-                label="Surface Pressure",
-                value=current_data['surface_psi'] if current_data['surface_psi'] else 0,
-                unit="PSI",
-                color="#0078D4",
-                icon="📊",
-                trend=trend_psi,
-                min_val=psi_min,
-                max_val=psi_max
-            )
-        
-        with card_col3:
-            metric_card(
-                label="Annulus Pressure",
-                value=current_data['annulus_psi'] if current_data['annulus_psi'] else 0,
-                unit="PSI",
-                color="#20C997",
-                icon="⚙️",
-                trend=trend_annulus,
-                min_val=annulus_min,
-                max_val=annulus_max
-            )
-
-        with card_col4:
-            metric_card(
-                label="Total Injected Volume",
-                value=total_injected_volume,
-                unit="bbl",
-                color="#15D6C9",
-                icon="💧"
-            )
-    
-    # Display KPIs and timeseries
-    st.subheader("Analytics")
-    render_digital_twin(current_data or {})
+    render_live_monitoring()
 
     subset_start, subset_end = get_excel_date_range()
     if subset_start and subset_end:
@@ -1153,3 +1458,82 @@ elif page == "SEGY Analysis":
                         header_fields = {"TRACE_SEQUENCE_FILE": segyio.TraceField.TRACE_SEQUENCE_FILE, "TRACE_SEQUENCE_LINE": segyio.TraceField.TRACE_SEQUENCE_LINE, "FieldRecord": segyio.TraceField.FieldRecord, "TraceNumber": segyio.TraceField.TraceNumber, "CDP": segyio.TraceField.CDP, "CDP_TRACE": segyio.TraceField.CDP_TRACE, "GroupX": segyio.TraceField.GroupX, "GroupY": segyio.TraceField.GroupY, "SourceX": segyio.TraceField.SourceX, "SourceY": segyio.TraceField.SourceY, "DelayRecordingTime": segyio.TraceField.DelayRecordingTime, "TRACE_SAMPLE_INTERVAL": segyio.TraceField.TRACE_SAMPLE_INTERVAL}
                         headers_df = pd.DataFrame({"Header": list(header_fields), "Value": [int(header[field]) for field in header_fields.values()]})
                     st.dataframe(headers_df, hide_index=True, width="stretch")
+
+elif page == "AI Chatbot":
+    st.header("AI Chatbot")
+    st.caption("Select exactly one source. Every answer and chart is restricted to that source.")
+
+    source = st.segmented_control(
+        "Data source",
+        ["PostgreSQL - Full Data Table", "SEGY Files"],
+        default="PostgreSQL - Full Data Table",
+        key="chat_source",
+    )
+    st.info(f"Currently selected source: **{source}**")
+
+    source_key = "postgresql" if source.startswith("PostgreSQL") else "segy"
+    history_key = f"chat_messages_{source_key}"
+    if history_key not in st.session_state:
+        st.session_state[history_key] = []
+
+    selected_segy_path = None
+    if source_key == "postgresql":
+        st.caption("The chatbot searches the full PostgreSQL table automatically. Include a date or time phrase in your question when you need a specific period.")
+    else:
+        file_index = build_segy_file_index(Path("data/segy"))
+        available_files = sorted(file_index.items(), key=lambda item: (item[0][0], item[0][1]))
+        file_labels = [f"Event {event_id} - {well} - {path.name}" for (event_id, well), path in available_files]
+        selected_label = st.selectbox("Select a SEGY file", file_labels) if file_labels else None
+        if selected_label:
+            selected_segy_path = available_files[file_labels.index(selected_label)][1]
+        uploaded_segy = st.file_uploader("Or upload one SEGY file", type=["sgy", "segy"], key="chat_segy_upload")
+        if uploaded_segy is not None:
+            with tempfile.NamedTemporaryFile(suffix=Path(uploaded_segy.name).suffix, delete=False) as temp_file:
+                temp_file.write(uploaded_segy.getbuffer())
+                selected_segy_path = Path(temp_file.name)
+            st.caption(f"Currently selected source file: {uploaded_segy.name}")
+        elif selected_segy_path is not None:
+            st.caption(f"Currently selected source file: {selected_segy_path.name}")
+        if selected_segy_path is None:
+            st.warning("Select or upload a SEGY file before asking questions.")
+
+    for message_index, message in enumerate(st.session_state[history_key]):
+        with st.chat_message(message["role"]):
+            st.caption(f"Source: {message['source']}")
+            st.markdown(message["content"])
+            if message.get("chart") is not None:
+                st.plotly_chart(
+                    message["chart"],
+                    use_container_width=True,
+                    key=f"chat-chart-{source_key}-{message_index}",
+                )
+
+    prompt = st.chat_input("Ask about the selected data source...", key=f"chat_input_{source_key}")
+    if prompt:
+        message_source = source
+        st.session_state[history_key].append({"role": "user", "content": prompt, "source": message_source})
+        with st.chat_message("user"):
+            st.caption(f"Source: {message_source}")
+            st.markdown(prompt)
+
+        if source_key == "postgresql":
+            answer, chart = render_postgres_chat_answer(
+                prompt,
+                history=st.session_state[history_key],
+            )
+        else:
+            answer, chart = render_segy_chat_answer(
+                prompt,
+                selected_segy_path,
+                history=st.session_state[history_key],
+            )
+        st.session_state[history_key].append({"role": "assistant", "content": answer, "source": message_source, "chart": chart})
+        with st.chat_message("assistant"):
+            st.caption(f"Source: {message_source}")
+            st.markdown(answer)
+            if chart is not None:
+                st.plotly_chart(
+                    chart,
+                    use_container_width=True,
+                    key=f"chat-chart-{source_key}-{len(st.session_state[history_key]) - 1}",
+                )

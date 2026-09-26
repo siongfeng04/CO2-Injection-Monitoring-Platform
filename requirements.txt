@@ -13,5 +13,6 @@ openpyxl
 segyio
 obspy
 streamlit
+streamlit-autorefresh
 requests
 xlrd

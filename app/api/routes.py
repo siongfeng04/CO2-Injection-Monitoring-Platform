@@ -158,6 +158,58 @@ def dashboard_metrics(
     }
 
 
+@router.get("/chat/fulldata")
+def chat_fulldata(
+    columns: str,
+    start: str = None,
+    end: str = None,
+    limit: int = 5000,
+    db: Session = Depends(get_db),
+):
+    column_map = {
+        "surface_temperature": models.FullData.surface_temp,
+        "surface_pressure": models.FullData.surface_psi,
+        "annulus_pressure": models.FullData.annulus_psi,
+        "flowrate_meter": models.FullData.flowrate_meter,
+        "pump_speed": models.FullData.pump_speed,
+        "calc_flow_from_pump_speed": models.FullData.calc_flow_from_pump_speed,
+        "flow_bpm": models.FullData.flow_bpm,
+        "temperature_before_triplex": models.FullData.temperature_before_triplex,
+        "pressure_before_triplex": models.FullData.pressure_before_triplex,
+        "bottom_hole_pressure": models.FullData.bhp,
+        "corrected_bottom_hole_pressure": models.FullData.corrected_bhp,
+        "bottom_hole_temperature": models.FullData.bht,
+    }
+    requested = [name.strip() for name in columns.split(",") if name.strip()]
+    selected = [name for name in requested if name in column_map]
+    if not selected:
+        raise HTTPException(status_code=400, detail="No supported fulldata columns were requested")
+
+    try:
+        start_dt = datetime.fromisoformat(start) if start else None
+        end_dt = datetime.fromisoformat(end) if end else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="start and end must be ISO timestamps") from exc
+    if start_dt and end_dt and end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    query = db.query(models.FullData.timestamp, *[column_map[name].label(name) for name in selected])
+    if start_dt:
+        query = query.filter(models.FullData.timestamp >= start_dt)
+    if end_dt:
+        query = query.filter(models.FullData.timestamp <= end_dt)
+    rows = query.order_by(models.FullData.timestamp).limit(min(max(limit, 1), 5000)).all()
+    return {
+        "source": "fulldata",
+        "columns": selected,
+        "row_count": len(rows),
+        "data": [
+            {"timestamp": timestamp.isoformat() if timestamp else None, **{name: value for name, value in zip(selected, values)}}
+            for timestamp, *values in rows
+        ],
+    }
+
+
 @router.get("/wells")
 def list_wells(use_excel: bool = True, db: Session = Depends(get_db)):
     if use_excel:
