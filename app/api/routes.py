@@ -19,9 +19,24 @@ from app.services.prediction import analyze_fulldata
 import tempfile
 from fastapi.responses import JSONResponse
 from datetime import datetime
-from sqlalchemy import text
+from sqlalchemy import func, text
 
 router = APIRouter()
+
+FULLDATA_CHAT_COLUMN_MAP = {
+    "surface_temperature": models.FullData.surface_temp,
+    "surface_pressure": models.FullData.surface_psi,
+    "annulus_pressure": models.FullData.annulus_psi,
+    "flowrate_meter": models.FullData.flowrate_meter,
+    "pump_speed": models.FullData.pump_speed,
+    "calc_flow_from_pump_speed": models.FullData.calc_flow_from_pump_speed,
+    "flow_bpm": models.FullData.flow_bpm,
+    "temperature_before_triplex": models.FullData.temperature_before_triplex,
+    "pressure_before_triplex": models.FullData.pressure_before_triplex,
+    "bottom_hole_pressure": models.FullData.bhp,
+    "corrected_bottom_hole_pressure": models.FullData.corrected_bhp,
+    "bottom_hole_temperature": models.FullData.bht,
+}
 
 
 @router.get("/")
@@ -166,22 +181,8 @@ def chat_fulldata(
     limit: int = 5000,
     db: Session = Depends(get_db),
 ):
-    column_map = {
-        "surface_temperature": models.FullData.surface_temp,
-        "surface_pressure": models.FullData.surface_psi,
-        "annulus_pressure": models.FullData.annulus_psi,
-        "flowrate_meter": models.FullData.flowrate_meter,
-        "pump_speed": models.FullData.pump_speed,
-        "calc_flow_from_pump_speed": models.FullData.calc_flow_from_pump_speed,
-        "flow_bpm": models.FullData.flow_bpm,
-        "temperature_before_triplex": models.FullData.temperature_before_triplex,
-        "pressure_before_triplex": models.FullData.pressure_before_triplex,
-        "bottom_hole_pressure": models.FullData.bhp,
-        "corrected_bottom_hole_pressure": models.FullData.corrected_bhp,
-        "bottom_hole_temperature": models.FullData.bht,
-    }
     requested = [name.strip() for name in columns.split(",") if name.strip()]
-    selected = [name for name in requested if name in column_map]
+    selected = [name for name in requested if name in FULLDATA_CHAT_COLUMN_MAP]
     if not selected:
         raise HTTPException(status_code=400, detail="No supported fulldata columns were requested")
 
@@ -193,12 +194,15 @@ def chat_fulldata(
     if start_dt and end_dt and end_dt < start_dt:
         raise HTTPException(status_code=400, detail="end must be after start")
 
-    query = db.query(models.FullData.timestamp, *[column_map[name].label(name) for name in selected])
+    query = db.query(
+        models.FullData.timestamp,
+        *[FULLDATA_CHAT_COLUMN_MAP[name].label(name) for name in selected],
+    )
     if start_dt:
         query = query.filter(models.FullData.timestamp >= start_dt)
     if end_dt:
         query = query.filter(models.FullData.timestamp <= end_dt)
-    rows = query.order_by(models.FullData.timestamp).limit(min(max(limit, 1), 5000)).all()
+    rows = query.order_by(models.FullData.timestamp).limit(min(max(limit, 1), 100000)).all()
     return {
         "source": "fulldata",
         "columns": selected,
@@ -207,6 +211,76 @@ def chat_fulldata(
             {"timestamp": timestamp.isoformat() if timestamp else None, **{name: value for name, value in zip(selected, values)}}
             for timestamp, *values in rows
         ],
+    }
+
+
+@router.get("/chat/fulldata/summary")
+def chat_fulldata_summary(
+    column: str,
+    operation: str,
+    start: str = None,
+    end: str = None,
+    db: Session = Depends(get_db),
+):
+    selected_column = FULLDATA_CHAT_COLUMN_MAP.get(column)
+    if selected_column is None:
+        raise HTTPException(status_code=400, detail="Unsupported fulldata column")
+
+    operation_aliases = {
+        "average": "average",
+        "mean": "average",
+        "avg": "average",
+        "minimum": "minimum",
+        "min": "minimum",
+        "lowest": "minimum",
+        "maximum": "maximum",
+        "max": "maximum",
+        "highest": "maximum",
+        "count": "count",
+    }
+    normalized_operation = operation_aliases.get(operation.lower())
+    if normalized_operation is None:
+        raise HTTPException(status_code=400, detail="Unsupported summary operation")
+
+    try:
+        start_dt = datetime.fromisoformat(start) if start else None
+        end_dt = datetime.fromisoformat(end) if end else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="start and end must be ISO timestamps") from exc
+    if start_dt and end_dt and end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    query = db.query(
+        func.count(models.FullData.timestamp).label("record_count"),
+        func.count(selected_column).label("value_count"),
+        func.min(models.FullData.timestamp).label("first_timestamp"),
+        func.max(models.FullData.timestamp).label("last_timestamp"),
+    )
+    if normalized_operation == "average":
+        aggregate = func.avg(selected_column)
+    elif normalized_operation == "minimum":
+        aggregate = func.min(selected_column)
+    elif normalized_operation == "maximum":
+        aggregate = func.max(selected_column)
+    else:
+        aggregate = func.count(models.FullData.timestamp)
+    query = query.add_columns(aggregate.label("value"))
+
+    if start_dt:
+        query = query.filter(models.FullData.timestamp >= start_dt)
+    if end_dt:
+        query = query.filter(models.FullData.timestamp <= end_dt)
+
+    result = query.one()
+    return {
+        "source": "fulldata",
+        "column": column,
+        "operation": normalized_operation,
+        "value": float(result.value) if result.value is not None else None,
+        "record_count": int(result.record_count or 0),
+        "value_count": int(result.value_count or 0),
+        "first_timestamp": result.first_timestamp.isoformat() if result.first_timestamp else None,
+        "last_timestamp": result.last_timestamp.isoformat() if result.last_timestamp else None,
     }
 
 

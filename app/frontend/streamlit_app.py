@@ -7,6 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import io
 import numpy as np
+import re
 import segyio
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -15,12 +16,14 @@ from streamlit_autorefresh import st_autorefresh
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
+from dateutil import parser as date_parser
 
 load_dotenv()
 
 st.set_page_config(page_title="CCS Digital Twin", layout="wide")
 
 MONITORING_CURRENT_TIMESTAMP = "2009-09-25 03:00:01"
+DATA_REFRESH_INTERVAL_MS = 60_000
 
 st.title("CCS Digital Twin — Injection Monitoring")
 
@@ -530,11 +533,17 @@ def classify_chat_intent(question):
 
 
 def chatbot_full_data_columns(question):
-    normalized = question.lower()
+    normalized = re.sub(r"[-_/]+", " ", question.lower())
     selected = []
+    matched_phrases = []
     for phrase, column in sorted(FULLDATA_CHAT_COLUMNS.items(), key=lambda item: len(item[0]), reverse=True):
-        if phrase in normalized and column not in selected:
+        if (
+            phrase in normalized
+            and not any(phrase in matched_phrase for matched_phrase in matched_phrases)
+            and column not in selected
+        ):
             selected.append(column)
+            matched_phrases.append(phrase)
     if not selected:
         selected = [
             "corrected_bottom_hole_pressure",
@@ -547,7 +556,224 @@ def chatbot_full_data_columns(question):
     return selected
 
 
-def render_postgres_chat_answer(question, history=None):
+def has_explicit_chat_measurement(question):
+    normalized = re.sub(r"[-_/]+", " ", question.lower())
+    return any(phrase in normalized for phrase in FULLDATA_CHAT_COLUMNS)
+
+
+CHAT_DATE_RANGE_PATTERN = re.compile(
+    r"\b(?:from|between)\s+(.+?)\s+(?:to|until|through|and)\s+(.+?)(?:[?.!,]|$)",
+    re.IGNORECASE,
+)
+
+
+def parse_chat_date_range(question):
+    match = CHAT_DATE_RANGE_PATTERN.search(question)
+    if not match:
+        return None, None, None
+
+    try:
+        start_date = date_parser.parse(match.group(1), dayfirst=True, fuzzy=True).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end_date = date_parser.parse(match.group(2), dayfirst=True, fuzzy=True).replace(
+            hour=23, minute=59, second=59, microsecond=999999
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        return None, None, f"I could not understand the requested date range: {exc}"
+
+    if end_date < start_date:
+        return None, None, "The requested end date must be on or after the start date."
+    return start_date, end_date, None
+
+
+def chat_summary_operation(question):
+    question_lower = question.lower()
+    if any(word in question_lower for word in ["average", "mean", "avg"]):
+        return "average"
+    if any(word in question_lower for word in ["maximum", "max", "highest", "peak"]):
+        return "maximum"
+    if any(word in question_lower for word in ["minimum", "min", "lowest"]):
+        return "minimum"
+    if any(phrase in question_lower for phrase in ["how many", "count", "number of"]):
+        return "count"
+    return None
+
+
+def render_chat_summary(question, columns, operation, end_timestamp=None):
+    start_date, end_date, date_error = parse_chat_date_range(question)
+    if date_error:
+        return date_error
+
+    params = {"operation": operation}
+    if start_date:
+        params["start"] = start_date.isoformat()
+        params["end"] = end_date.isoformat()
+
+    answers = []
+    for column in columns:
+        params = {"column": column, **params}
+        if end_timestamp is not None:
+            params["end"] = end_timestamp.isoformat()
+        response = api_get(
+            "/api/chat/fulldata/summary",
+            params=params,
+            timeout=30,
+        )
+        if response is None:
+            return "The PostgreSQL summary could not be retrieved."
+        if response["value"] is None:
+            answers.append(
+                f"No numeric {FULLDATA_CHAT_LABELS.get(column, column)} values are available for the requested period."
+            )
+            continue
+
+        if operation == "count":
+            value_text = f"{int(response['value']):,} records"
+        else:
+            value_text = f"{response['value']:,.3f}"
+        period_text = ""
+        if start_date:
+            period_text = f" from {start_date:%d %B %Y} to {end_date:%d %B %Y}"
+        answers.append(
+            f"{operation.title()} {FULLDATA_CHAT_LABELS.get(column, column)}{period_text}: {value_text}."
+        )
+
+    return "\n\n".join(
+        [
+            "Data source: PostgreSQL - Full Data Table",
+            *answers,
+        ]
+    )
+
+
+def render_chat_evaluation(question, history, end_timestamp=None):
+    question_lower = question.lower().strip()
+    evaluation_terms = ["good", "safe", "normal", "acceptable", "high", "low"]
+    if not any(
+        re.search(rf"\b{re.escape(term)}\b", question_lower)
+        for term in evaluation_terms
+    ):
+        return None
+
+    previous_question = next(
+        (
+            message["content"]
+            for message in reversed((history or [])[:-1])
+            if message.get("role") == "user"
+            and has_explicit_chat_measurement(message["content"])
+        ),
+        "",
+    )
+    context_question = question if has_explicit_chat_measurement(question) else previous_question
+    columns = chatbot_full_data_columns(context_question)
+    if not context_question:
+        return "Please specify the measurement and the engineering limit or reference range to use for the assessment."
+
+    column = columns[0]
+    summaries = {}
+    for operation in ["average", "minimum", "maximum"]:
+        params = {"column": column, "operation": operation}
+        if end_timestamp is not None:
+            params["end"] = end_timestamp.isoformat()
+        response = api_get(
+            "/api/chat/fulldata/summary",
+            params=params,
+            timeout=30,
+        )
+        if response is None:
+            return "The PostgreSQL summary could not be retrieved."
+        summaries[operation] = response
+
+    average = summaries["average"].get("value")
+    minimum = summaries["minimum"].get("value")
+    maximum = summaries["maximum"].get("value")
+    label = FULLDATA_CHAT_LABELS.get(column, column)
+    if average is None or minimum is None or maximum is None:
+        return f"The PostgreSQL Full Data Table does not contain enough numeric values to assess {label}."
+
+    industry_context = "industry standard" in question_lower or "industry-standard" in question_lower
+    if industry_context:
+        assessment = (
+            "There is no single universal industry-wide pass/fail temperature for CO2 injection. "
+            "Acceptability depends on the reservoir and well design, phase behavior, caprock and fracture-pressure limits, "
+            "well-material limits, and applicable regulations."
+        )
+    else:
+        assessment = (
+            "Whether this is good, safe, or acceptable cannot be determined from the measurement alone; "
+            "it requires an approved engineering limit or reference range."
+        )
+
+    return (
+        f"The PostgreSQL Full Data Table reports an average {label} of {average:,.3f}. "
+        f"The observed data range is {minimum:,.3f} to {maximum:,.3f}. "
+        f"{assessment}"
+    )
+
+
+def render_chat_chart_explanation(question, history):
+    question_lower = question.lower().strip()
+    explanation_terms = ["explain", "insight", "interpret", "meaning", "what does", "describe"]
+    if not any(term in question_lower for term in explanation_terms):
+        return None
+
+    chart_message = next(
+        (
+            message
+            for message in reversed((history or [])[:-1])
+            if message.get("role") == "assistant" and message.get("chart") is not None
+        ),
+        None,
+    )
+    if chart_message is None:
+        return None
+
+    figure = chart_message["chart"]
+    insights = []
+    for trace in figure.data:
+        values = pd.to_numeric(pd.Series(trace.y), errors="coerce")
+        valid_values = values.dropna()
+        if valid_values.empty:
+            continue
+
+        label = trace.name or "Measurement"
+        minimum = float(valid_values.min())
+        maximum = float(valid_values.max())
+        first_value = float(valid_values.iloc[0])
+        last_value = float(valid_values.iloc[-1])
+        change = last_value - first_value
+        if first_value:
+            change_pct = change / abs(first_value) * 100
+            change_text = f"{change:+,.3f} ({change_pct:+.1f}%) from the first to the last point"
+        else:
+            change_text = f"{change:+,.3f} from the first to the last point"
+
+        peak_index = int(valid_values.idxmax())
+        peak_time = None
+        if trace.x is not None and peak_index < len(trace.x):
+            peak_time = pd.to_datetime(trace.x[peak_index], errors="coerce")
+        peak_text = f"; peak at {peak_time:%Y-%m-%d %H:%M}" if pd.notna(peak_time) else ""
+        insights.append(
+            f"**{label}:** ranged from {minimum:,.3f} to {maximum:,.3f}; "
+            f"{change_text}{peak_text}."
+        )
+
+    if not insights:
+        return "The chart does not contain enough numeric data to explain its main pattern."
+
+    return "**Important chart insights**\n\n" + "\n\n".join(insights)
+
+
+def render_postgres_chat_answer(question, history=None, end_timestamp=None):
+    chart_explanation = render_chat_chart_explanation(question, history)
+    if chart_explanation:
+        return chart_explanation, None
+
+    evaluation_answer = render_chat_evaluation(question, history, end_timestamp=end_timestamp)
+    if evaluation_answer:
+        return evaluation_answer, None
+
     chat_intent = classify_chat_intent(question)
     if chat_intent == "greeting":
         return (
@@ -573,12 +799,19 @@ def render_postgres_chat_answer(question, history=None):
         )
 
     columns = chatbot_full_data_columns(question)
+    operation = chat_summary_operation(question)
+    if operation:
+        return render_chat_summary(question, columns, operation, end_timestamp=end_timestamp), None
+
+    chat_params = {
+        "columns": ",".join(columns),
+        "limit": 100000,
+    }
+    if end_timestamp is not None:
+        chat_params["end"] = end_timestamp.isoformat()
     response = api_get(
         "/api/chat/fulldata",
-        params={
-            "columns": ",".join(columns),
-            "limit": 5000,
-        },
+        params=chat_params,
         timeout=30,
     )
     data = pd.DataFrame((response or {}).get("data", []))
@@ -657,6 +890,30 @@ def render_postgres_chat_answer(question, history=None):
     if chart_kind:
         summary.append(f"Generated a {chart_kind} chart from the selected PostgreSQL columns.")
     local_answer = "\n\n".join(summary)
+    deterministic_query = any(
+        word in question_lower
+        for word in [
+            "average",
+            "mean",
+            "avg",
+            "maximum",
+            "max",
+            "highest",
+            "peak",
+            "minimum",
+            "min",
+            "lowest",
+            "latest",
+            "current",
+            "now",
+            "last",
+            "how many",
+            "count",
+            "number of",
+        ]
+    )
+    if deterministic_query:
+        return local_answer, chart
     llm_answer = call_llm(
         question,
         "PostgreSQL - Full Data Table",
@@ -713,8 +970,8 @@ def style_segy_figure(fig, height=460):
     return fig
 
 
-def render_live_monitoring():
-    current_data = get_current_data()
+def render_live_monitoring(simulated_time=None):
+    current_data = get_current_data(timestamp=simulated_time)
     if current_data:
         update_time = current_data["timestamp"].strftime("%d/%m/%Y %I:%M:%S %p")
         st.info(f"📊 Dashboard updated at {update_time}")
@@ -803,7 +1060,7 @@ else:
     if "page" in st.session_state:
         default_page = st.session_state["page"]
 
-nav_options = ["Overview", "Prediction", "Injection Optimization Simulator", "Anomaly Detection", "SEGY Analysis", "AI Chatbot"]
+nav_options = ["Overview", "Prediction", "Injection Optimization Simulator", "SEGY Analysis", "AI Chatbot"]
 try:
     default_index = nav_options.index(default_page)
 except Exception:
@@ -814,26 +1071,27 @@ st.session_state["page"] = page
 if callable(set_qs):
     set_qs(page=page)
 
-st.info("Using existing Excel source: data/excel/combined_co2_data_only_file.xls")
-if st.button("Reload data from Excel"):
-    # clear cached session data so UI reloads from excel source on next actions
-    for k in ["metrics", "anomalies", "forecast", "simulation"]:
-        if k in st.session_state:
-            del st.session_state[k]
-    st.success("Cleared session cache — use Load Metrics / Run Forecast to reload from Excel")
+simulated_time = get_monitoring_timestamp() if page in {"Overview", "Prediction"} else None
+if simulated_time is not None:
+    st_autorefresh(interval=DATA_REFRESH_INTERVAL_MS, key="dashboard_refresh")
+context_col, refresh_col = st.columns([4, 1])
+with context_col:
+    st.info("Using existing Excel source: data/excel/combined_co2_data_only_file.xls")
+with refresh_col:
+    if simulated_time is not None:
+        render_simulated_clock()
+    refresh_requested = st.button("Refresh data", use_container_width=True, key="global_refresh")
+if refresh_requested:
+    for key in ["metrics", "prediction_analysis", "anomalies", "forecast", "simulation"]:
+        st.session_state.pop(key, None)
+    st.rerun()
 
 col1, col2 = st.columns([1, 3])
 
 if page == "Overview":
-    st_autorefresh(interval=60_000, key="overview_refresh")
-    overview_title_col, clock_col = st.columns([3, 2])
-    with overview_title_col:
-        st.header("Dashboard")
-    with clock_col:
-        render_simulated_clock()
-    render_live_monitoring()
+    st.header("Dashboard")
+    render_live_monitoring(simulated_time)
 
-    simulated_time = get_monitoring_timestamp()
     subset_start, subset_end = get_excel_date_range(end_timestamp=simulated_time)
     if subset_start and subset_end:
         render_daily_injection_charts(subset_start, subset_end)
@@ -891,7 +1149,7 @@ if page == "Overview":
     
     # Only load metrics on demand with a button
     if st.button("Load Detailed Metrics"):
-        start, end = get_excel_date_range(end_timestamp=get_monitoring_timestamp())
+        start, end = get_excel_date_range(end_timestamp=simulated_time)
         if start and end:
             with st.spinner("Loading metrics..."):
                 params = {"start": f"{start}T00:00:00", "end": query_end_timestamp(end)}
@@ -915,14 +1173,14 @@ if page == "Overview":
 
 elif page == "Prediction":
     st.header("Bottom-Hole Conditions")
-    prediction_start, prediction_end = get_excel_date_range()
+    prediction_start, prediction_end = get_excel_date_range(end_timestamp=simulated_time)
     if prediction_start and prediction_end:
         with st.spinner("Loading fulldata charts..."):
             prediction_response = api_get(
                 "/api/dashboard/metrics",
                 params={
                     "start": f"{prediction_start}T00:00:00",
-                    "end": f"{prediction_end}T23:59:59",
+                    "end": query_end_timestamp(prediction_end),
                 },
                 timeout=30,
             )
@@ -1082,78 +1340,6 @@ elif page == "Prediction":
                 )
                 st.plotly_chart(importance_fig, use_container_width=True)
 
-    prediction_controls, prediction_results = st.columns([1, 1])
-
-    with prediction_controls:
-        st.header("Predictive - Pressure Forecast")
-        # No well selection: train using Excel-source aggregated data or default behavior
-        if st.button("Train Pressure Model"):
-            resp = api_post("/api/train-pressure", params={"use_excel": True})
-            if resp is not None:
-                st.success("Model trained")
-                st.write(resp.get("metrics"))
-
-        # Default forecast start date from Excel range if available
-        s_start, s_end = get_excel_date_range()
-        if s_start:
-            try:
-                default_start = pd.to_datetime(s_start).date()
-            except Exception:
-                default_start = None
-        else:
-            default_start = None
-
-        start_date = st.date_input("Forecast start date", value=default_start)
-        days = st.number_input("Days to forecast", min_value=1, max_value=365, value=14)
-        inj_rate = st.number_input("Assumed injection rate (what-if)", value=0.0)
-        if st.button("Run Forecast"):
-            params = {"start": start_date.isoformat(), "days": int(days), "injection_rate": float(inj_rate), "use_excel": True}
-            resp = api_get("/api/predict-pressure", params=params)
-            if resp is not None:
-                st.session_state["forecast"] = resp.get("predictions")
-
-        # Auto-run a default forecast once per session if not present and default_start available
-        if "forecast" not in st.session_state and default_start is not None:
-            params = {"start": default_start.isoformat(), "days": int(days), "injection_rate": float(inj_rate), "use_excel": True}
-            resp = api_get("/api/predict-pressure", params=params)
-            if resp is not None:
-                st.session_state["forecast"] = resp.get("predictions")
-
-        st.header("What-if Simulator")
-        st.write("Upload a CSV with columns `date,injection_rate` or enter manual schedule below.")
-        uploaded_sched = st.file_uploader("Upload schedule CSV", type=["csv"], key="sched")
-        manual_date = st.date_input("Manual date", [])
-        manual_rate = st.number_input("Manual injection rate", value=0.0, key="manual_rate")
-        if uploaded_sched is not None:
-            sched_df = pd.read_csv(uploaded_sched)
-            schedule = sched_df.to_dict(orient="records")
-        else:
-            schedule = []
-            if len(manual_date) == 2:
-                schedule = [{"date": manual_date[0].isoformat(), "injection_rate": manual_rate}, {"date": manual_date[1].isoformat(), "injection_rate": manual_rate}]
-
-        if st.button("Run What-if"):
-            payload = {"schedule": schedule}
-            resp = api_post("/api/simulate-whatif", json=payload)
-            if resp is not None:
-                st.session_state["simulation"] = resp.get("simulation")
-
-    with prediction_results:
-        st.header("Forecast Results")
-        forecast = st.session_state.get("forecast")
-        if forecast:
-            fdf = pd.DataFrame(forecast)
-            fdf["timestamp"] = pd.to_datetime(fdf["timestamp"])
-            fig = px.line(fdf, x="timestamp", y="predicted_bhp", title="Predicted BHP")
-            st.plotly_chart(fig, use_container_width=True)
-
-        sim = st.session_state.get("simulation")
-        if sim:
-            sdf = pd.DataFrame(sim)
-            sdf["timestamp"] = pd.to_datetime(sdf["timestamp"])
-            fig2 = px.line(sdf, x="timestamp", y="predicted_bhp", title="What-if Predicted BHP")
-            st.plotly_chart(fig2, use_container_width=True)
-
 elif page == "Injection Optimization Simulator":
     st.header("Injection Optimization Simulator")
     st.write("Use the trained CBHP and BHT models to test operating limits before injection.")
@@ -1285,33 +1471,6 @@ elif page == "Injection Optimization Simulator":
         st.caption(f"CBHP model: {result['models']['cbhp']} | BHT model: {result['models']['bht']}")
     elif not result:
         st.info("Enter operating conditions and run an optimization mode to see recommendations.")
-
-elif page == "Anomaly Detection":
-    with col1:
-        st.header("Anomaly Detection Filters")
-        # Auto-detect date range from Excel
-        start, end = get_excel_date_range()
-        if start and end:
-            st.info(f"Date range detected: {start} → {end}")
-            if st.button("Load Anomalies"):
-                with st.spinner("Detecting anomalies..."):
-                    params = {"start": start, "end": end, "use_excel": True}
-                    resp = api_get("/api/anomalies", params=params, timeout=30)
-                    if resp is not None:
-                        st.session_state["anomalies"] = resp.get("anomalies")
-        else:
-            st.warning("Could not detect date range from Excel. Please ensure the file and sheet/column exist.")
-
-    with col2:
-        st.header("Anomalies")
-        anomalies = st.session_state.get("anomalies")
-        if anomalies:
-            a_df = pd.DataFrame(anomalies)
-            if not a_df.empty:
-                a_df["timestamp"] = pd.to_datetime(a_df["timestamp"])
-                st.write(a_df)
-                fig2 = px.scatter(a_df, x="timestamp", y="bhp", color="anomaly", title="Anomaly timeline")
-                st.plotly_chart(fig2, use_container_width=True)
 
 elif page == "SEGY Analysis":
     st.markdown(
@@ -1526,6 +1685,33 @@ elif page == "AI Chatbot":
         if selected_segy_path is None:
             st.warning("Select or upload a SEGY file before asking questions.")
 
+    suggested_prompts = (
+        [
+            "What is the latest corrected bottom-hole pressure?",
+            "Show the average bottom-hole temperature.",
+            "Plot corrected bottom hole pressure over time.",
+            "Compare pressure and pump speed.",
+        ]
+        if source_key == "postgresql"
+        else [
+            "Show metadata for this SEGY file.",
+            "How many traces and samples does it contain?",
+            "What is the sampling interval?",
+            "Show the waveform for the selected channel.",
+        ]
+    )
+    st.caption("Try a question")
+    prompt_from_button = None
+    prompt_columns = st.columns(2)
+    for prompt_index, suggested_prompt in enumerate(suggested_prompts):
+        with prompt_columns[prompt_index % 2]:
+            if st.button(
+                suggested_prompt,
+                key=f"chat-prompt-{source_key}-{prompt_index}",
+                use_container_width=True,
+            ):
+                prompt_from_button = suggested_prompt
+
     for message_index, message in enumerate(st.session_state[history_key]):
         with st.chat_message(message["role"]):
             st.caption(f"Source: {message['source']}")
@@ -1537,7 +1723,8 @@ elif page == "AI Chatbot":
                     key=f"chat-chart-{source_key}-{message_index}",
                 )
 
-    prompt = st.chat_input("Ask about the selected data source...", key=f"chat_input_{source_key}")
+    typed_prompt = st.chat_input("Ask about the selected data source...", key=f"chat_input_{source_key}")
+    prompt = prompt_from_button or typed_prompt
     if prompt:
         message_source = source
         st.session_state[history_key].append({"role": "user", "content": prompt, "source": message_source})
@@ -1549,6 +1736,7 @@ elif page == "AI Chatbot":
             answer, chart = render_postgres_chat_answer(
                 prompt,
                 history=st.session_state[history_key],
+                end_timestamp=simulated_time,
             )
         else:
             answer, chart = render_segy_chat_answer(
