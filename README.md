@@ -57,9 +57,18 @@ for corrected bottom-hole pressure and bottom-hole temperature. It compares Line
 Regression, Random Forest, and Gradient Boosting, then displays the selected model's
 metrics, residuals, actual-vs-predicted charts, time-series chart, and feature importance.
 
+AI Chatbot knowledge base (RAG)
+
+The AI Chatbot answers threshold, safety, and guideline questions (for example "What is the maximum allowable CBHP?" or "Is the latest annulus pressure safe?") from the documents in `docs/knowledge_base/`. The main document is `co2_injection_thresholds.md`, which lists the Normal / Warning / Critical thresholds for each measurement.
+
+- Documents are split by heading and embedded with the OpenAI embeddings API (`OPENAI_EMBEDDING_MODEL`, default `text-embedding-3-small`). Embeddings are cached in `docs/knowledge_base/.embeddings_cache.json` and rebuilt automatically when a document changes.
+- Without `OPENAI_API_KEY`, retrieval falls back to local TF-IDF search and the chatbot shows the most relevant section instead of a generated answer.
+- To add knowledge, drop more `.md` or `.txt` files into `docs/knowledge_base/`. No restart is needed.
+
 API endpoints
 
 - `GET /api/health` — verify database connectivity.
+- `GET /api/knowledge/search?q=TEXT&top_k=4` — retrieve knowledge-base sections for the chatbot.
 - `GET /api/data/fulldata?limit=10` — return recent rows from `fulldata`.
 - `GET /api/data/subset-data?limit=10` — return recent rows from `subset_data`.
 - `GET /api/dashboard/metrics?start=ISO&end=ISO` — return PostgreSQL KPIs and chart-ready time series.

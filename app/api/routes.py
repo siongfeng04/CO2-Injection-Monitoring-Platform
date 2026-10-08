@@ -13,6 +13,7 @@ from app.crud import (
 )
 from app.services.analysis import compute_kpis, detect_anomalies
 from app.services import excel_source
+from app.services import knowledge_base
 from app.services.fulldata import import_full_data, latest_operating_conditions
 from app.services import prediction as prediction_service
 from app.services.prediction import analyze_fulldata
@@ -282,6 +283,12 @@ def chat_fulldata_summary(
         "first_timestamp": result.first_timestamp.isoformat() if result.first_timestamp else None,
         "last_timestamp": result.last_timestamp.isoformat() if result.last_timestamp else None,
     }
+
+
+@router.get("/knowledge/search")
+def knowledge_search(q: str, top_k: int = 4):
+    """Retrieve knowledge-base sections (thresholds, guidelines) relevant to a question."""
+    return knowledge_base.search(q, top_k=top_k)
 
 
 @router.get("/wells")

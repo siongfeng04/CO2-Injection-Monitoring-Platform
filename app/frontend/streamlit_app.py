@@ -62,35 +62,48 @@ def api_post(path: str, json=None, params=None, timeout=30):
         return None
 
 
-def call_llm(question, source, context, history=None):
+def call_llm(question, source, context, history=None, knowledge=None):
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
 
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a precise data assistant for a CCS Digital Twin. "
-                f"The only permitted source for this answer is: {source}. "
-                "Use only the supplied context. Never invent values, units, trends, or facts. "
-                "If the context does not answer the question, say that the information cannot be determined "
-                "from the selected source. Answer naturally and briefly. Mention the data source used."
-            ),
-        }
-    ]
+    system_prompt = (
+        "You are a precise data assistant for a CCS Digital Twin. "
+        f"The only permitted source for this answer is: {source}. "
+        "Use only the supplied context. Never invent values, units, trends, or facts. "
+        "Copy numbers exactly as given, and only use a unit if the context shows it for that measurement. "
+        "If the context does not answer the question, say that the information cannot be determined "
+        "from the selected source. Answer naturally and briefly. Mention the data source used. "
+        "If the context says a chart was generated, the app displays that chart directly below your answer: "
+        "never say you cannot plot; briefly describe what the chart shows using the supplied values."
+    )
+    if knowledge:
+        system_prompt += (
+            " You may also use the supplied CO2 Injection Knowledge Base excerpts for threshold values, "
+            "operating limits, alarm levels, definitions, and recommended actions. "
+            "When comparing data with a threshold, state the measured value, the threshold, and the alarm level "
+            "(Normal, Warning, or Critical). Check the value against both the lower and upper bounds of each level "
+            "and any data-quality, low-limit, or not-injecting rules before deciding; a value below the Normal range "
+            "is not Normal. If the well is not injecting, say that the injection alarm levels do not directly apply. "
+            "Say whether a threshold is a physical, regulatory, or project "
+            "design-basis value, and cite the knowledge-base section you used, e.g. (KB: section name)."
+        )
+    messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages.extend(
-            {"role": item["role"], "content": item["content"]}
+            {"role": item["role"], "content": re.sub(r"\n*_Knowledge base: [^\n]*_$", "", item["content"])}
             for item in history[-6:]
             if item["role"] in {"user", "assistant"}
         )
     messages.append(
         {
             "role": "user",
-            "content": f"Question: {question}\n\nSelected-source context:\n{context}",
+            "content": (
+                f"Question: {question}\n\nSelected-source context:\n{context}"
+                + (f"\n\nCO2 Injection Knowledge Base excerpts:\n{knowledge}" if knowledge else "")
+            ),
         }
     )
     try:
@@ -242,7 +255,7 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
     bottom_pressure = display_value(
         current_data.get("corrected_bottom_hole_pressure") or current_data.get("bhp"), "PSI"
     )
-    bottom_temperature = display_value(current_data.get("bht"), "°C", 1)
+    bottom_temperature = display_value(current_data.get("bht"), "°F", 1)
     flow = display_value(flow_bpm, "BPM", 2)
 
     st.markdown(
@@ -438,6 +451,7 @@ def build_segy_file_index(segy_dir):
 FULLDATA_CHAT_COLUMNS = {
     "corrected bottom hole pressure": "corrected_bottom_hole_pressure",
     "corrected bhp": "corrected_bottom_hole_pressure",
+    "cbhp": "corrected_bottom_hole_pressure",
     "bottom hole pressure": "bottom_hole_pressure",
     "bhp": "bottom_hole_pressure",
     "bottom hole temperature": "bottom_hole_temperature",
@@ -461,7 +475,7 @@ FULLDATA_CHAT_COLUMNS = {
 FULLDATA_CHAT_LABELS = {
     "corrected_bottom_hole_pressure": "Corrected Bottom-Hole Pressure (PSI)",
     "bottom_hole_pressure": "Bottom-Hole Pressure (PSI)",
-    "bottom_hole_temperature": "Bottom-Hole Temperature (°C)",
+    "bottom_hole_temperature": "Bottom-Hole Temperature (°F)",
     "surface_pressure": "Surface Pressure (PSI)",
     "annulus_pressure": "Annulus Pressure (PSI)",
     "flow_bpm": "Flow Rate (BPM)",
@@ -561,6 +575,84 @@ def has_explicit_chat_measurement(question):
     return any(phrase in normalized for phrase in FULLDATA_CHAT_COLUMNS)
 
 
+KNOWLEDGE_QUESTION_TERMS = [
+    "threshold", "limit", "allowable", "allowed", "permitted", "safe", "unsafe", "safety",
+    "alarm", "warning", "critical", "normal range", "operating range", "guideline", "standard",
+    "regulation", "regulatory", "epa", "class vi", "fracture", "maip", "masip", "supercritical",
+    "critical point", "phase", "shut in", "shutdown", "shut down", "what should", "what to do",
+    "action", "procedure", "response", "integrity", "leak", "cavitation", "saturation",
+    "purity", "impurit", "define", "definition", "meaning of", "what is a", "what does",
+    "knowledge base", "document",
+]
+
+
+def is_knowledge_question(question):
+    normalized = re.sub(r"[-_/]+", " ", question.lower())
+    return any(term in normalized for term in KNOWLEDGE_QUESTION_TERMS)
+
+
+def fetch_knowledge(question, top_k=4):
+    """Retrieve relevant knowledge-base sections; returns [] if the API is unavailable."""
+    try:
+        resp = requests.get(api_url("/api/knowledge/search"), params={"q": question, "top_k": top_k}, timeout=60)
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+    except (RequestException, ValueError) as exc:
+        hint = " Restart the FastAPI backend so it loads the knowledge-base endpoint." if "404" in str(exc) else ""
+        st.warning(f"CO2 Injection Knowledge Base is unavailable, so thresholds were not used. ({exc}){hint}")
+        return []
+
+
+def format_knowledge_context(results):
+    return "\n\n---\n\n".join(f"[KB: {item['section']}]\n{item['text']}" for item in results)
+
+
+def knowledge_sources_text(results):
+    sections = list(dict.fromkeys(item["section"] for item in results))
+    return "Knowledge base: " + "; ".join(sections)
+
+
+def answer_sources(source, local_answer, knowledge_results):
+    """Name the sources an answer actually used, for the chat "Source" caption."""
+    if knowledge_results and not local_answer:
+        return "CO2 Injection Knowledge Base"
+    if knowledge_results:
+        return f"{source} + CO2 Injection Knowledge Base"
+    return source
+
+
+def answer_with_gpt(question, source, local_answer, history=None, knowledge_results=None):
+    """Send every chatbot answer through GPT, grounded on the local result and knowledge base.
+
+    Returns ``(answer, answered_by)``. If GPT is unavailable, the local database answer
+    (and the most relevant knowledge-base section) is shown instead.
+    """
+    knowledge = format_knowledge_context(knowledge_results) if knowledge_results else None
+    llm_answer = call_llm(
+        question,
+        f"{source} + CO2 Injection Knowledge Base" if knowledge else source,
+        local_answer or "No measurement data was requested for this question; answer from the knowledge base.",
+        history=history,
+        knowledge=knowledge,
+    )
+    if llm_answer:
+        if knowledge_results:
+            llm_answer += f"\n\n_{knowledge_sources_text(knowledge_results)}_"
+        return llm_answer, "GPT"
+
+    parts = [local_answer] if local_answer else []
+    if knowledge_results:
+        top = knowledge_results[0]
+        parts.append(f"**Knowledge base: {top['section']}**\n\n{top['text'].split(chr(10) + chr(10), 1)[-1]}")
+    if local_answer and knowledge_results:
+        answered_by = "database + knowledge base"
+    elif knowledge_results:
+        answered_by = "knowledge base"
+    else:
+        answered_by = "database"
+    return "\n\n".join(parts), answered_by
+
+
 CHAT_DATE_RANGE_PATTERN = re.compile(
     r"\b(?:from|between)\s+(.+?)\s+(?:to|until|through|and)\s+(.+?)(?:[?.!,]|$)",
     re.IGNORECASE,
@@ -647,13 +739,44 @@ def render_chat_summary(question, columns, operation, end_timestamp=None):
     )
 
 
+def latest_chat_values(column, last_timestamp, end_timestamp=None):
+    """Return the latest value of ``column``, its 1-hour change, and the latest flow rate."""
+    if not last_timestamp:
+        return None
+    last_time = pd.to_datetime(last_timestamp)
+    columns = [column] if column == "flow_bpm" else [column, "flow_bpm"]
+    params = {
+        "columns": ",".join(columns),
+        "start": (last_time - timedelta(hours=1)).isoformat(),
+        "end": (end_timestamp or last_time).isoformat(),
+        "limit": 100000,
+    }
+    response = api_get("/api/chat/fulldata", params=params, timeout=30)
+    data = pd.DataFrame((response or {}).get("data", []))
+    if data.empty or column not in data:
+        return None
+    data[columns] = data[columns].apply(pd.to_numeric, errors="coerce")
+    values = data.dropna(subset=[column])
+    if values.empty:
+        return None
+    flows = data["flow_bpm"].dropna()
+    return {
+        "timestamp": values["timestamp"].iloc[-1],
+        "value": float(values[column].iloc[-1]),
+        "hour_change": float(values[column].iloc[-1] - values[column].iloc[0]),
+        "flow_bpm": float(flows.iloc[-1]) if not flows.empty else None,
+    }
+
+
 def render_chat_evaluation(question, history, end_timestamp=None):
+    """Return ``(local_answer, knowledge_results)`` for good/safe/threshold questions, else None."""
     question_lower = question.lower().strip()
     evaluation_terms = ["good", "safe", "normal", "acceptable", "high", "low"]
-    if not any(
+    is_evaluation = any(
         re.search(rf"\b{re.escape(term)}\b", question_lower)
         for term in evaluation_terms
-    ):
+    )
+    if not is_evaluation and not (is_knowledge_question(question) and has_explicit_chat_measurement(question)):
         return None
 
     previous_question = next(
@@ -666,9 +789,12 @@ def render_chat_evaluation(question, history, end_timestamp=None):
         "",
     )
     context_question = question if has_explicit_chat_measurement(question) else previous_question
-    columns = chatbot_full_data_columns(context_question)
     if not context_question:
-        return "Please specify the measurement and the engineering limit or reference range to use for the assessment."
+        if is_knowledge_question(question):
+            # No measurement named: let the knowledge-base path answer (e.g. "what is a safe limit?").
+            return None
+        return "Please specify the measurement and the engineering limit or reference range to use for the assessment.", None
+    columns = chatbot_full_data_columns(context_question)
 
     column = columns[0]
     summaries = {}
@@ -682,7 +808,7 @@ def render_chat_evaluation(question, history, end_timestamp=None):
             timeout=30,
         )
         if response is None:
-            return "The PostgreSQL summary could not be retrieved."
+            return "The PostgreSQL summary could not be retrieved.", None
         summaries[operation] = response
 
     average = summaries["average"].get("value")
@@ -690,7 +816,30 @@ def render_chat_evaluation(question, history, end_timestamp=None):
     maximum = summaries["maximum"].get("value")
     label = FULLDATA_CHAT_LABELS.get(column, column)
     if average is None or minimum is None or maximum is None:
-        return f"The PostgreSQL Full Data Table does not contain enough numeric values to assess {label}."
+        return f"The PostgreSQL Full Data Table does not contain enough numeric values to assess {label}.", None
+
+    data_lines = [
+        "Data source: PostgreSQL - Full Data Table",
+        f"Measurement: {label}",
+        f"Average: {average:,.3f}; minimum: {minimum:,.3f}; maximum: {maximum:,.3f}",
+    ]
+    latest = latest_chat_values(column, summaries["average"].get("last_timestamp"), end_timestamp)
+    if latest:
+        data_lines.append(
+            f"Latest value at {pd.to_datetime(latest['timestamp']):%Y-%m-%d %H:%M:%S}: {latest['value']:,.3f} "
+            f"(change over the previous hour: {latest['hour_change']:+,.3f})"
+        )
+        if latest["flow_bpm"] is not None:
+            injecting = "injecting" if latest["flow_bpm"] > 1.0 else "not injecting (flow <= 1.0 BPM)"
+            data_lines.append(f"Latest flow rate: {latest['flow_bpm']:,.3f} BPM - well is {injecting}")
+        else:
+            data_lines.append(
+                "Latest flow rate: not recorded in the previous hour, so whether the well is injecting is unknown"
+            )
+
+    knowledge_results = fetch_knowledge(f"{label} threshold limits alarm levels. {question}")
+    if knowledge_results:
+        return "\n\n".join(data_lines), knowledge_results
 
     industry_context = "industry standard" in question_lower or "industry-standard" in question_lower
     if industry_context:
@@ -709,7 +858,7 @@ def render_chat_evaluation(question, history, end_timestamp=None):
         f"The PostgreSQL Full Data Table reports an average {label} of {average:,.3f}. "
         f"The observed data range is {minimum:,.3f} to {maximum:,.3f}. "
         f"{assessment}"
-    )
+    ), None
 
 
 def render_chat_chart_explanation(question, history):
@@ -765,14 +914,21 @@ def render_chat_chart_explanation(question, history):
     return "**Important chart insights**\n\n" + "\n\n".join(insights)
 
 
-def render_postgres_chat_answer(question, history=None, end_timestamp=None):
+def build_postgres_chat_context(question, history=None, end_timestamp=None):
+    """Return ``(local_answer, chart, knowledge_results)`` from PostgreSQL and the knowledge base."""
     chart_explanation = render_chat_chart_explanation(question, history)
     if chart_explanation:
-        return chart_explanation, None
+        return chart_explanation, None, None
 
-    evaluation_answer = render_chat_evaluation(question, history, end_timestamp=end_timestamp)
-    if evaluation_answer:
-        return evaluation_answer, None
+    evaluation = render_chat_evaluation(question, history, end_timestamp=end_timestamp)
+    if evaluation:
+        evaluation_answer, knowledge_results = evaluation
+        return evaluation_answer, None, knowledge_results
+
+    if is_knowledge_question(question):
+        knowledge_results = fetch_knowledge(question)
+        if knowledge_results:
+            return None, None, knowledge_results
 
     chat_intent = classify_chat_intent(question)
     if chat_intent == "greeting":
@@ -780,9 +936,10 @@ def render_postgres_chat_answer(question, history=None, end_timestamp=None):
             "Hello! I can answer questions using only the PostgreSQL Full Data Table. "
             "Ask me about pressure, temperature, flowrate, pump speed, trends, averages, or comparisons.",
             None,
+            None,
         )
     if chat_intent == "thanks":
-        return "You're welcome! Ask another question about the PostgreSQL Full Data Table whenever you are ready.", None
+        return "You're welcome! Ask another question about the PostgreSQL Full Data Table whenever you are ready.", None, None
     if chat_intent == "help":
         return (
             "You can ask natural-language questions about the PostgreSQL Full Data Table, for example:\n\n"
@@ -792,16 +949,21 @@ def render_postgres_chat_answer(question, history=None, end_timestamp=None):
             "- Show the flowrate trend over time.\n"
             "- Compare flowrate with pump speed.\n"
             "- Is there a correlation between pressure and temperature?\n"
-            "- How many records are in the table?\n\n"
+            "- How many records are in the table?\n"
+            "- What is the maximum allowable CBHP?\n"
+            "- Is the latest annulus pressure safe?\n"
+            "- What should I do if surface pressure reaches the critical level?\n\n"
+            "Threshold, safety, and guideline questions are answered from the CO2 Injection Knowledge Base. "
             "I will query the PostgreSQL data and say when a requested value is unavailable. "
             "You can also ask for a trend, comparison, or correlation chart.",
+            None,
             None,
         )
 
     columns = chatbot_full_data_columns(question)
     operation = chat_summary_operation(question)
     if operation:
-        return render_chat_summary(question, columns, operation, end_timestamp=end_timestamp), None
+        return render_chat_summary(question, columns, operation, end_timestamp=end_timestamp), None, None
 
     chat_params = {
         "columns": ",".join(columns),
@@ -816,13 +978,13 @@ def render_postgres_chat_answer(question, history=None, end_timestamp=None):
     )
     data = pd.DataFrame((response or {}).get("data", []))
     if data.empty:
-        return "No records are available in the PostgreSQL Full Data Table for that question.", None
+        return "No records are available in the PostgreSQL Full Data Table for that question.", None, None
     data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce")
     requested = [column for column in columns if column in data]
     numeric = data[requested].apply(pd.to_numeric, errors="coerce")
     valid = numeric.dropna(how="all")
     if valid.empty:
-        return f"The PostgreSQL Full Data Table has no numeric values for {', '.join(FULLDATA_CHAT_LABELS.get(column, column) for column in requested)}.", None
+        return f"The PostgreSQL Full Data Table has no numeric values for {', '.join(FULLDATA_CHAT_LABELS.get(column, column) for column in requested)}.", None, None
 
     question_lower = question.lower()
     first_timestamp = data["timestamp"].min()
@@ -832,7 +994,7 @@ def render_postgres_chat_answer(question, history=None, end_timestamp=None):
     if "correlation" in question_lower and len(requested) >= 2:
         correlation_data = data[[requested[0], requested[1]]].apply(pd.to_numeric, errors="coerce").dropna()
         if correlation_data.empty:
-            return "The selected PostgreSQL columns do not contain enough numeric values for a correlation chart.", None
+            return "The selected PostgreSQL columns do not contain enough numeric values for a correlation chart.", None, None
         chart = px.scatter(correlation_data, x=requested[0], y=requested[1], title=f"{FULLDATA_CHAT_LABELS.get(requested[0], requested[0])} vs {FULLDATA_CHAT_LABELS.get(requested[1], requested[1])}", labels={requested[0]: FULLDATA_CHAT_LABELS.get(requested[0], requested[0]), requested[1]: FULLDATA_CHAT_LABELS.get(requested[1], requested[1])})
         chart.update_layout(legend_title_text="PostgreSQL - Full Data Table")
         chart_kind = "correlation"
@@ -846,7 +1008,7 @@ def render_postgres_chat_answer(question, history=None, end_timestamp=None):
             value_name="value",
         ).dropna(subset=["value"])
         if trend_data.empty:
-            return "The selected PostgreSQL columns do not contain numeric values for a trend chart.", None
+            return "The selected PostgreSQL columns do not contain numeric values for a trend chart.", None, None
         trend_data["measurement"] = trend_data["measurement"].map(
             lambda column: FULLDATA_CHAT_LABELS.get(column, column)
         )
@@ -889,47 +1051,41 @@ def render_postgres_chat_answer(question, history=None, end_timestamp=None):
                 summary.append(f"{FULLDATA_CHAT_LABELS.get(column, column)}: latest {values.iloc[-1]:,.3f}; average {values.mean():,.3f}")
     if chart_kind:
         summary.append(f"Generated a {chart_kind} chart from the selected PostgreSQL columns.")
-    local_answer = "\n\n".join(summary)
-    deterministic_query = any(
-        word in question_lower
-        for word in [
-            "average",
-            "mean",
-            "avg",
-            "maximum",
-            "max",
-            "highest",
-            "peak",
-            "minimum",
-            "min",
-            "lowest",
-            "latest",
-            "current",
-            "now",
-            "last",
-            "how many",
-            "count",
-            "number of",
-        ]
-    )
-    if deterministic_query:
-        return local_answer, chart
-    llm_answer = call_llm(
-        question,
-        "PostgreSQL - Full Data Table",
-        local_answer,
-        history=history,
-    )
-    return llm_answer or local_answer, chart
+    if chart is not None:
+        for column in requested:
+            values = numeric[column].dropna()
+            if values.empty:
+                continue
+            peak_time = data.loc[values.idxmax(), "timestamp"]
+            summary.append(
+                f"{FULLDATA_CHAT_LABELS.get(column, column)} chart values: first {values.iloc[0]:,.3f}, "
+                f"last {values.iloc[-1]:,.3f}, minimum {values.min():,.3f}, "
+                f"maximum {values.max():,.3f} at {peak_time:%Y-%m-%d %H:%M}"
+            )
+    return "\n\n".join(summary), chart, None
 
 
-def render_segy_chat_answer(question, selected_path, history=None):
+def render_postgres_chat_answer(question, history=None, end_timestamp=None):
+    """Answer every PostgreSQL question with GPT; returns ``(answer, chart, answered_by, sources)``."""
+    local_answer, chart, knowledge_results = build_postgres_chat_context(question, history, end_timestamp)
+    answer, answered_by = answer_with_gpt(
+        question, "PostgreSQL - Full Data Table", local_answer, history, knowledge_results
+    )
+    return answer, chart, answered_by, answer_sources("PostgreSQL - Full Data Table", local_answer, knowledge_results)
+
+
+def build_segy_chat_context(question, selected_path):
+    """Return ``(local_answer, chart, knowledge_results)`` from the SEGY file and the knowledge base."""
+    if is_knowledge_question(question):
+        knowledge_results = fetch_knowledge(question)
+        if knowledge_results:
+            return None, None, knowledge_results
     if selected_path is None:
-        return "No SEGY file is selected. Select an existing file or upload one before asking a question.", None
+        return "No SEGY file is selected. Select an existing file or upload one before asking a question.", None, None
     try:
         bundle = load_segy_file(str(selected_path))
     except Exception as exc:
-        return f"The selected SEGY file could not be read: {exc}", None
+        return f"The selected SEGY file could not be read: {exc}", None, None
     traces = bundle["traces"]
     samples = bundle["samples"]
     sample_rate_hz = 1_000_000.0 / bundle["sample_interval_us"]
@@ -945,14 +1101,19 @@ def render_segy_chat_answer(question, selected_path, history=None):
         frequencies, amplitude = get_fft_spectrum(traces[0].astype(float), sample_rate_hz)
         dominant_frequency = float(frequencies[np.argmax(amplitude)]) if len(amplitude) else None
         if dominant_frequency is None:
-            return "A frequency value cannot be determined from the selected SEGY file.", None
+            return "A frequency value cannot be determined from the selected SEGY file.", None, None
         summary.append(f"Dominant frequency of the first trace: {dominant_frequency:,.3f} Hz.")
         chart = px.line(x=frequencies, y=amplitude, title=f"SEGY amplitude spectrum: {selected_path.name}", labels={"x": "Frequency (Hz)", "y": "Amplitude"})
     elif "metadata" not in question_lower and not any(word in question_lower for word in ["sample", "trace", "channel", "file", "sampling"]):
-        return "The requested information cannot be determined from the selected SEGY data. Ask about metadata, traces, waveforms, sampling, or frequency content.", None
-    local_answer = "\n\n".join(summary)
-    llm_answer = call_llm(question, "SEGY Files", local_answer, history=history)
-    return llm_answer or local_answer, chart
+        return "The requested information cannot be determined from the selected SEGY data. Ask about metadata, traces, waveforms, sampling, or frequency content.", None, None
+    return "\n\n".join(summary), chart, None
+
+
+def render_segy_chat_answer(question, selected_path, history=None):
+    """Answer every SEGY question with GPT; returns ``(answer, chart, answered_by, sources)``."""
+    local_answer, chart, knowledge_results = build_segy_chat_context(question, selected_path)
+    answer, answered_by = answer_with_gpt(question, "SEGY Files", local_answer, history, knowledge_results)
+    return answer, chart, answered_by, answer_sources("SEGY Files", local_answer, knowledge_results)
 
 
 def style_segy_figure(fig, height=460):
@@ -1222,7 +1383,7 @@ elif page == "Prediction":
                     metric_card(
                         label="Bottom-Hole Temperature",
                         value=latest_temperature,
-                        unit="°C",
+                        unit="°F",
                         color="#FF6B6B",
                         icon="🌡️",
                         trend=temperature_trend,
@@ -1420,7 +1581,7 @@ elif page == "Injection Optimization Simulator":
                 )
                 st.caption(f"Safe operating limit: {limit * (1 - safety_margin_pct / 100):.2f} psi")
             else:
-                limit = st.number_input("Maximum allowable BHT (°C)", value=95.0, key="optimizer_bht_limit")
+                limit = st.number_input("Maximum allowable BHT (°F)", value=125.0, key="optimizer_bht_limit")
         with action_col:
             st.caption("The optimizer evaluates the selected flow range using the existing Prediction models.")
             run_optimizer = st.button("Run optimization", type="primary", key="optimizer_run")
@@ -1459,17 +1620,17 @@ elif page == "Injection Optimization Simulator":
         if mode == "temperature_control" and not result.get("feasible", True):
             closest = result["closest_result"]
             st.warning(
-                f"No flow in the selected range satisfies the BHT limit of {result['bht_limit']:.2f} °C. "
-                f"The closest result is {closest['predicted_bht']:.2f} °C at {closest['flow_bpm']:.2f} BPM."
+                f"No flow in the selected range satisfies the BHT limit of {result['bht_limit']:.2f} °F. "
+                f"The closest result is {closest['predicted_bht']:.2f} °F at {closest['flow_bpm']:.2f} BPM."
             )
             result_col1, result_col2 = st.columns(2)
             result_col1.metric("Closest flow", f"{closest['flow_bpm']:.2f} BPM")
-            result_col2.metric("Closest predicted BHT", f"{closest['predicted_bht']:.2f} °C")
+            result_col2.metric("Closest predicted BHT", f"{closest['predicted_bht']:.2f} °F")
         elif mode == "maximum_injection":
             result_col1, result_col2, result_col3 = st.columns(3)
             result_col1.metric("Recommended flow", f"{result['recommended_flow_bpm']:.2f} BPM")
             result_col2.metric("Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
-            result_col3.metric("Predicted BHT", f"{result['predicted_bht']:.2f} °C")
+            result_col3.metric("Predicted BHT", f"{result['predicted_bht']:.2f} °F")
         elif mode == "safe_operation":
             result_col1, result_col2, result_col3 = st.columns(3)
             result_col1.metric("Maximum safe flow", f"{result['recommended_flow_bpm']:.2f} BPM")
@@ -1484,7 +1645,7 @@ elif page == "Injection Optimization Simulator":
             result_col1, result_col2, result_col3 = st.columns(3)
             result_col1.metric("Acceptable flow range", f"{result['acceptable_flow_min_bpm']:.2f} - {result['acceptable_flow_max_bpm']:.2f} BPM")
             result_col2.metric("CBHP range", f"{acceptable_df['predicted_cbhp'].min():.2f} - {acceptable_df['predicted_cbhp'].max():.2f} psi")
-            result_col3.metric("BHT limit", f"{result['bht_limit']:.2f} °C")
+            result_col3.metric("BHT limit", f"{result['bht_limit']:.2f} °F")
             chart = px.line(
                 acceptable_df,
                 x="flow_bpm",
@@ -1676,7 +1837,10 @@ elif page == "SEGY Analysis":
 
 elif page == "AI Chatbot":
     st.header("AI Chatbot")
-    st.caption("Select exactly one source. Every answer and chart is restricted to that source.")
+    st.caption(
+        "Select exactly one source. Every answer and chart is restricted to that source. "
+        "Threshold, safety, and guideline questions also use the CO2 Injection Knowledge Base (docs/knowledge_base)."
+    )
 
     source = st.segmented_control(
         "Data source",
@@ -1718,6 +1882,8 @@ elif page == "AI Chatbot":
             "Show the average bottom-hole temperature.",
             "Plot corrected bottom hole pressure over time.",
             "Compare pressure and pump speed.",
+            "What is the maximum allowable CBHP?",
+            "Is the latest corrected bottom hole pressure safe?",
         ]
         if source_key == "postgresql"
         else [
@@ -1743,6 +1909,8 @@ elif page == "AI Chatbot":
         with st.chat_message(message["role"]):
             st.caption(f"Source: {message['source']}")
             st.markdown(message["content"])
+            if message.get("answered_by"):
+                st.caption(f"Answered by: {message['answered_by']}")
             if message.get("chart") is not None:
                 st.plotly_chart(
                     message["chart"],
@@ -1760,21 +1928,22 @@ elif page == "AI Chatbot":
             st.markdown(prompt)
 
         if source_key == "postgresql":
-            answer, chart = render_postgres_chat_answer(
+            answer, chart, answered_by, answer_source = render_postgres_chat_answer(
                 prompt,
                 history=st.session_state[history_key],
                 end_timestamp=simulated_time,
             )
         else:
-            answer, chart = render_segy_chat_answer(
+            answer, chart, answered_by, answer_source = render_segy_chat_answer(
                 prompt,
                 selected_segy_path,
                 history=st.session_state[history_key],
             )
-        st.session_state[history_key].append({"role": "assistant", "content": answer, "source": message_source, "chart": chart})
+        st.session_state[history_key].append({"role": "assistant", "content": answer, "source": answer_source, "chart": chart, "answered_by": answered_by})
         with st.chat_message("assistant"):
-            st.caption(f"Source: {message_source}")
+            st.caption(f"Source: {answer_source}")
             st.markdown(answer)
+            st.caption(f"Answered by: {answered_by}")
             if chart is not None:
                 st.plotly_chart(
                     chart,
