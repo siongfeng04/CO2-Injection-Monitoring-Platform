@@ -41,6 +41,7 @@ OPTIMIZATION_FEATURES = {
     ],
     "bht": ["surface_temp", "flow_bpm", "pump_speed", "surface_psi", "annulus_psi"],
 }
+FUTURE_FORECAST_POINTS = 24
 
 
 def _recording_mask(timestamps: pd.Series) -> pd.Series:
@@ -128,11 +129,31 @@ def _fit_target(frame: pd.DataFrame, target: str, label: str) -> dict[str, Any]:
             zip(FEATURES, importance), key=lambda item: item[1], reverse=True
         )
     ]
+    full_model = candidates[best_name].fit(x, y)
+    time_delta = frame["timestamp"].diff().dropna().median()
+    if pd.isna(time_delta) or time_delta <= pd.Timedelta(0):
+        time_delta = pd.Timedelta(hours=1)
+    future_timestamps = [
+        frame["timestamp"].iloc[-1] + time_delta * step
+        for step in range(1, FUTURE_FORECAST_POINTS + 1)
+    ]
+    latest_features = frame[FEATURES].iloc[[-1]].copy()
+    future_values = full_model.predict(
+        pd.concat([latest_features] * FUTURE_FORECAST_POINTS, ignore_index=True)
+    )
+    future_predictions = [
+        {
+            "timestamp": timestamp.strftime("%Y-%m-%dT%H:%M:%S"),
+            "predicted": float(value),
+        }
+        for timestamp, value in zip(future_timestamps, future_values)
+    ]
     return {
         "label": label,
         "best_model": best_name,
         "metrics": results,
         "test_predictions": test_frame.to_dict(orient="records"),
+        "future_predictions": future_predictions,
         "feature_importance": feature_importance,
         "row_count": int(len(frame)),
     }

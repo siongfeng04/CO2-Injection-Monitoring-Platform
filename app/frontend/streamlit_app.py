@@ -1292,6 +1292,7 @@ elif page == "Prediction":
                 st.dataframe(metrics_df, use_container_width=True)
 
             test_df = pd.DataFrame(target_data.get("test_predictions", []))
+            future_df = pd.DataFrame(target_data.get("future_predictions", []))
             importance_df = pd.DataFrame(target_data.get("feature_importance", []))
             if test_df.empty:
                 st.warning("No test predictions were returned for this target.")
@@ -1327,6 +1328,32 @@ elif page == "Prediction":
                 title=f"{target_data.get('label')}: Actual vs Predicted Over Time",
                 labels={"value": target_data.get("label"), "timestamp": "Date and time"},
             )
+            if target_key == "pressure" and not future_df.empty:
+                future_df["timestamp"] = pd.to_datetime(future_df["timestamp"])
+                future_fig = px.line(
+                    future_df,
+                    x="timestamp",
+                    y="predicted",
+                    labels={
+                        "predicted": target_data.get("label"),
+                        "timestamp": "Date and time",
+                    },
+                )
+                future_trace = future_fig.data[0]
+                future_trace.name = "Future forecast"
+                future_trace.line = {"dash": "dash", "color": "#FF7F0E", "width": 3}
+                time_fig.add_trace(future_trace)
+                time_fig.add_vline(
+                    x=test_df["timestamp"].max(),
+                    line_dash="dot",
+                    line_color="#888888",
+                    annotation_text="Forecast starts",
+                    annotation_position="top left",
+                )
+                st.caption(
+                    "Future forecast uses the selected model with the latest operating "
+                    "conditions held constant for the next 24 recording intervals."
+                )
             st.plotly_chart(time_fig, use_container_width=True)
 
             if not importance_df.empty:
