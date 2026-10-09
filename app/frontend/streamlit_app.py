@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import io
+import json
 import numpy as np
 import re
 import segyio
@@ -13,6 +14,7 @@ from pathlib import Path
 from datetime import date, datetime, timedelta
 import tempfile
 from streamlit_autorefresh import st_autorefresh
+from streamlit.errors import StreamlitAPIException
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
@@ -74,6 +76,7 @@ def call_llm(question, source, context, history=None, knowledge=None):
         f"The only permitted source for this answer is: {source}. "
         "Use only the supplied context. Never invent values, units, trends, or facts. "
         "Copy numbers exactly as given, and only use a unit if the context shows it for that measurement. "
+        "Write plain Markdown text only: never include images, image links, or URLs. "
         "If the context does not answer the question, say that the information cannot be determined "
         "from the selected source. Answer naturally and briefly. Mention the data source used. "
         "If the context says a chart was generated, the app displays that chart directly below your answer: "
@@ -132,6 +135,136 @@ def call_llm(question, source, context, history=None, knowledge=None):
         else:
             st.warning(f"LLM API unavailable; showing the local data response instead. ({exc})")
         return None
+
+
+# Page context for the floating AI assistant. Each full run records what the
+# current page displays (charts, metrics, tables, analysis text) so the assistant
+# can answer questions about exactly what the user is looking at.
+PAGE_CONTEXT_MAX_CHARS = 16000
+
+
+def reset_page_context(page, note=None):
+    st.session_state["page_context"] = {"page": page, "sections": {}}
+    if note:
+        add_page_context("Page information", note)
+
+
+def add_page_context(title, text):
+    context = st.session_state.get("page_context")
+    if context is None or not text:
+        return
+    context["sections"].setdefault(title, []).append(str(text).strip())
+
+
+def format_page_context():
+    context = st.session_state.get("page_context") or {}
+    text = "\n\n".join(
+        f"### {title}\n" + "\n".join(lines) for title, lines in context.get("sections", {}).items()
+    )
+    if len(text) > PAGE_CONTEXT_MAX_CHARS:
+        text = text[:PAGE_CONTEXT_MAX_CHARS] + "\n... (page context truncated)"
+    return text
+
+
+def _format_axis_value(value):
+    if isinstance(value, (pd.Timestamp, datetime, np.datetime64)) or (
+        isinstance(value, str) and re.match(r"^\d{4}-\d{2}-\d{2}", value)
+    ):
+        timestamp = pd.to_datetime(value, errors="coerce")
+        if pd.notna(timestamp):
+            return f"{timestamp:%Y-%m-%d %H:%M}"
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return f"{float(value):,.3f}"
+    return str(value)
+
+
+def summarize_figure(fig):
+    """Describe a Plotly figure's traces with the values a reader would see."""
+    layout = fig.layout
+    lines = []
+    x_title = layout.xaxis.title.text if layout.xaxis and layout.xaxis.title else None
+    y_title = layout.yaxis.title.text if layout.yaxis and layout.yaxis.title else None
+    if x_title or y_title:
+        lines.append(f"Axes: x = {x_title or 'unlabelled'}, y = {y_title or 'unlabelled'}")
+    for trace in list(fig.data)[:8]:
+        name = getattr(trace, "name", None) or getattr(trace, "legendgroup", None) or trace.type
+        if trace.type == "heatmap":
+            z = np.asarray(trace.z, dtype=float)
+            if z.size:
+                lines.append(
+                    f"- {name} (heatmap): {z.shape[0]} rows x {z.shape[1]} columns; "
+                    f"value range {np.nanmin(z):,.3f} to {np.nanmax(z):,.3f}"
+                )
+            continue
+        x_values = pd.Series(list(trace.x)) if getattr(trace, "x", None) is not None else pd.Series(dtype=object)
+        y_values = pd.Series(list(trace.y)) if getattr(trace, "y", None) is not None else pd.Series(dtype=object)
+        if trace.type == "histogram":
+            values = pd.to_numeric(x_values if not x_values.empty else y_values, errors="coerce").dropna()
+            if not values.empty:
+                lines.append(
+                    f"- {name} (histogram of {len(values):,} values): mean {values.mean():,.3f}, "
+                    f"std {values.std():,.3f}, min {values.min():,.3f}, max {values.max():,.3f}"
+                )
+            continue
+        y_numeric = pd.to_numeric(y_values, errors="coerce")
+        x_numeric = pd.to_numeric(x_values, errors="coerce")
+        if y_numeric.notna().sum() == 0 and x_numeric.notna().any():
+            # Horizontal bar chart: categories on y, values on x.
+            pairs = ", ".join(f"{label}: {_format_axis_value(value)}" for label, value in zip(y_values, x_values))
+            lines.append(f"- {name} ({trace.type}): {pairs[:1500]}")
+            continue
+        valid = y_numeric.notna()
+        if not valid.any():
+            continue
+        if valid.sum() <= 20:
+            pairs = ", ".join(
+                f"({_format_axis_value(x)}, {_format_axis_value(y)})"
+                for x, y in zip(x_values[valid], y_numeric[valid])
+            )
+            lines.append(f"- {name} ({trace.type}, {int(valid.sum())} points as (x, y)): {pairs}")
+            continue
+        y_valid = y_numeric[valid]
+        x_valid = x_values[valid] if len(x_values) == len(y_values) else pd.Series([None] * len(y_valid))
+        max_index, min_index = y_valid.idxmax(), y_valid.idxmin()
+        summary = (
+            f"- {name} ({trace.type}, {len(y_valid):,} points): "
+            f"first {y_valid.iloc[0]:,.3f}, last {y_valid.iloc[-1]:,.3f}, mean {y_valid.mean():,.3f}, "
+            f"min {y_valid.min():,.3f} at x={_format_axis_value(x_valid.get(min_index))}, "
+            f"max {y_valid.max():,.3f} at x={_format_axis_value(x_valid.get(max_index))}"
+        )
+        if not x_valid.empty and x_valid.iloc[0] is not None:
+            summary += f"; x from {_format_axis_value(x_valid.iloc[0])} to {_format_axis_value(x_valid.iloc[-1])}"
+        x_valid_numeric = pd.to_numeric(x_valid, errors="coerce")
+        if trace.type == "scatter" and getattr(trace, "mode", None) == "markers" and x_valid_numeric.notna().sum() > 2:
+            correlation = x_valid_numeric.corr(y_valid)
+            if pd.notna(correlation):
+                summary += f"; x-y correlation {correlation:.3f}"
+        lines.append(summary)
+    annotations = [annotation.text for annotation in (layout.annotations or []) if annotation.text]
+    if annotations:
+        lines.append("Annotations: " + "; ".join(annotations))
+    return "\n".join(lines)
+
+
+def show_chart(fig, **kwargs):
+    """Display a Plotly chart and record its summary for the page assistant."""
+    title = fig.layout.title.text if fig.layout.title and fig.layout.title.text else "Untitled chart"
+    add_page_context(f"Chart: {title}", summarize_figure(fig))
+    kwargs.setdefault("width", "stretch")
+    st.plotly_chart(fig, **kwargs)
+
+
+def show_table(df, title, **kwargs):
+    """Display a dataframe and record its first rows for the page assistant."""
+    add_page_context(f"Table: {title}", f"{len(df):,} rows. First rows:\n{df.head(15).to_string()}")
+    kwargs.setdefault("width", "stretch")
+    st.dataframe(df, **kwargs)
+
+
+def show_metric(container, label, value, **kwargs):
+    """Display an st.metric and record it for the page assistant."""
+    add_page_context("Displayed metrics", f"{label}: {value}")
+    container.metric(label, value, **kwargs)
 
 
 # Excel helper: detect the source range, optionally capped at simulated time
@@ -207,6 +340,12 @@ def metric_card(label: str, value: float, unit: str = "", color: str = "#0078D4"
     
     # Format value with 2 decimal places
     formatted_value = f"{value:.2f}" if isinstance(value, (int, float)) else "N/A"
+    card_details = [f"{label}: {formatted_value} {unit}".strip()]
+    if trend is not None:
+        card_details.append(f"trend {trend:+.2f}% vs the previous 10-reading average")
+    if min_val is not None and max_val is not None:
+        card_details.append(f"range {min_val:.1f} - {max_val:.1f} {unit}".strip())
+    add_page_context("Status cards", "; ".join(card_details))
     
     # Determine trend emoji and color
     trend_indicator = ""
@@ -257,6 +396,12 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
     )
     bottom_temperature = display_value(current_data.get("bht"), "°F", 1)
     flow = display_value(flow_bpm, "BPM", 2)
+    add_page_context(
+        "Digital twin well schematic",
+        f"Surface pressure {surface_psi}; surface temperature {surface_temp}; annulus pressure {annulus_psi}; "
+        f"corrected bottom-hole pressure {bottom_pressure}; bottom-hole temperature {bottom_temperature}; "
+        f"flow rate {flow}; hydrostatic head +1,582 PSI; fluid: supercritical CO2",
+    )
 
     st.markdown(
         f"""
@@ -371,7 +516,7 @@ def render_daily_injection_charts(start: str, end: str):
             hovertemplate="Day: %{x|%Y-%m-%d}<br>Injected volume: %{y:,.2f} bbl/day<extra></extra>"
         )
         injected_fig.update_layout(hovermode="x unified")
-        st.plotly_chart(injected_fig, use_container_width=True)
+        show_chart(injected_fig)
 
     with chart_col2:
         cumulative_fig = go.Figure(
@@ -392,7 +537,7 @@ def render_daily_injection_charts(start: str, end: str):
             yaxis_title="Cumulative Volume (bbl)",
             hovermode="x unified",
         )
-        st.plotly_chart(cumulative_fig, use_container_width=True)
+        show_chart(cumulative_fig)
 
 
 def toggle_flow_unit():
@@ -621,7 +766,7 @@ def answer_sources(source, local_answer, knowledge_results):
     return source
 
 
-def answer_with_gpt(question, source, local_answer, history=None, knowledge_results=None):
+def answer_with_gpt(question, source, local_answer, history=None, knowledge_results=None, local_label="database", fallback_answer=None):
     """Send every chatbot answer through GPT, grounded on the local result and knowledge base.
 
     Returns ``(answer, answered_by)``. If GPT is unavailable, the local database answer
@@ -640,16 +785,17 @@ def answer_with_gpt(question, source, local_answer, history=None, knowledge_resu
             llm_answer += f"\n\n_{knowledge_sources_text(knowledge_results)}_"
         return llm_answer, "GPT"
 
-    parts = [local_answer] if local_answer else []
+    shown_answer = fallback_answer or local_answer
+    parts = [shown_answer] if shown_answer else []
     if knowledge_results:
         top = knowledge_results[0]
         parts.append(f"**Knowledge base: {top['section']}**\n\n{top['text'].split(chr(10) + chr(10), 1)[-1]}")
     if local_answer and knowledge_results:
-        answered_by = "database + knowledge base"
+        answered_by = f"{local_label} + knowledge base"
     elif knowledge_results:
         answered_by = "knowledge base"
     else:
-        answered_by = "database"
+        answered_by = local_label
     return "\n\n".join(parts), answered_by
 
 
@@ -1116,6 +1262,146 @@ def render_segy_chat_answer(question, selected_path, history=None):
     return answer, chart, answered_by, answer_sources("SEGY Files", local_answer, knowledge_results)
 
 
+PAGE_ASSISTANT_SUGGESTIONS = {
+    "Overview": [
+        "Summarize the current well status.",
+        "Is the surface pressure normal?",
+        "Explain the flow rate chart.",
+    ],
+    "Prediction": [
+        "Which model performs best and why?",
+        "Explain the actual vs predicted chart.",
+        "What does the CBHP forecast show?",
+    ],
+    "Injection Optimization Simulator": [
+        "Explain the optimization result.",
+        "Is the recommended flow rate safe?",
+        "What does the safety margin mean?",
+    ],
+    "SEGY Analysis": [
+        "Summarize the analytical insights.",
+        "Explain the FFT spectrum.",
+        "Is the signal quality good?",
+    ],
+}
+ASSISTANT_EVALUATION_TERMS = ["good", "bad", "safe", "normal", "acceptable", "high", "low", "ok", "okay", "concern", "risk"]
+PAGE_ASSISTANT_CSS = """
+<style>
+.st-key-page_assistant {
+    position: fixed;
+    right: 1.75rem;
+    bottom: 1.75rem;
+    z-index: 1000;
+    width: auto !important;
+}
+.st-key-page_assistant button {
+    border-radius: 999px;
+    padding: 0.6rem 1.15rem;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+div[data-testid="stPopoverBody"] {
+    width: min(460px, calc(100vw - 2rem));
+    max-width: none;
+    max-height: calc(100vh - 6.5rem) !important;
+}
+</style>
+"""
+
+
+def answer_page_question(page, question, history):
+    """Answer a floating-assistant question from what the current page displays."""
+    page_context = format_page_context() or "No charts or analysis are currently displayed on this page."
+    normalized = question.lower()
+    wants_knowledge = is_knowledge_question(question) or any(
+        re.search(rf"\b{term}\b", normalized) for term in ASSISTANT_EVALUATION_TERMS
+    )
+    knowledge_results = fetch_knowledge(question) if wants_knowledge else []
+    answer, answered_by = answer_with_gpt(
+        question,
+        f"{page} page of the CCS Digital Twin (the charts, metrics, tables, and analysis currently displayed)",
+        page_context,
+        history,
+        knowledge_results,
+        local_label="page data",
+        fallback_answer="GPT is unavailable, so here is a summary of what this page currently shows:\n\n"
+        + page_context[:3000],
+    )
+    source = f"{page} page" + (" + CO2 Injection Knowledge Base" if knowledge_results else "")
+    return answer, answered_by, source
+
+
+def queue_assistant_suggestion():
+    st.session_state["assistant_pending_prompt"] = st.session_state.get("assistant_suggestion")
+    st.session_state["assistant_suggestion"] = None
+
+
+def clear_assistant_history(history_key):
+    st.session_state[history_key] = []
+
+
+@st.fragment
+def render_page_assistant(page):
+    """Floating "Ask AI" button (bottom right) that opens a chat about the current page."""
+    history_key = f"assistant_messages_{page}"
+    history = st.session_state.setdefault(history_key, [])
+    st.html(PAGE_ASSISTANT_CSS)
+    with st.container(key="page_assistant"):
+        with st.popover("Ask AI", icon=":material/smart_toy:", type="primary", help=f"Ask about the {page} page"):
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.markdown(f"**AI assistant** · {page}")
+                st.space("stretch")
+                st.button(
+                    "Clear",
+                    key="assistant_clear",
+                    icon=":material/delete:",
+                    type="tertiary",
+                    on_click=clear_assistant_history,
+                    args=(history_key,),
+                    disabled=not history,
+                )
+            st.caption("Answers use the charts and analysis on this page, plus the CO2 injection knowledge base.")
+            messages = st.container(height=320, border=False)
+            suggestions_slot = st.container()
+            prompt = st.chat_input(f"Ask about the {page} page...", key="assistant_input")
+            prompt = prompt or st.session_state.pop("assistant_pending_prompt", None)
+
+            with messages:
+                for message in history:
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["content"])
+                        if message.get("answered_by"):
+                            st.caption(f"Answered by: {message['answered_by']} · Source: {message['source']}")
+                if prompt:
+                    history.append({"role": "user", "content": prompt})
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+                    with st.chat_message("assistant"):
+                        with st.spinner("Thinking..."):
+                            answer, answered_by, source = answer_page_question(page, prompt, history[:-1])
+                        st.markdown(answer)
+                        st.caption(f"Answered by: {answered_by} · Source: {source}")
+                    history.append(
+                        {"role": "assistant", "content": answer, "answered_by": answered_by, "source": source}
+                    )
+                    # Redraw the assistant from history (hides the suggestion chips, enables Clear).
+                    try:
+                        st.rerun(scope="fragment")
+                    except StreamlitAPIException:
+                        st.rerun()
+                elif not history:
+                    st.caption("Ask anything about the charts and results on this page, or pick a suggestion below.")
+
+            if not history:
+                with suggestions_slot:
+                    st.pills(
+                        "Suggested questions",
+                        PAGE_ASSISTANT_SUGGESTIONS.get(page, []),
+                        key="assistant_suggestion",
+                        label_visibility="collapsed",
+                        on_change=queue_assistant_suggestion,
+                    )
+
+
 def style_segy_figure(fig, height=460):
     fig.update_layout(
         height=height,
@@ -1233,6 +1519,11 @@ if callable(set_qs):
     set_qs(page=page)
 
 simulated_time = get_monitoring_timestamp() if page in {"Overview", "Prediction"} else None
+reset_page_context(
+    page,
+    f"Page: {page}. Data source: data/excel/combined_co2_data_only_file.xls and PostgreSQL fulldata."
+    + (f" Simulated current time: {simulated_time:%Y-%m-%d %H:%M:%S} (data after this time is hidden)." if simulated_time is not None else ""),
+)
 if simulated_time is not None:
     st_autorefresh(interval=DATA_REFRESH_INTERVAL_MS, key="dashboard_refresh")
 context_col, refresh_col = st.columns([4, 1])
@@ -1286,7 +1577,7 @@ if page == "Overview":
                 title=f"Flow Rate (Subset Data) - {flow_label.split('(')[-1].rstrip(')')}",
                 labels={"date_time": "Date and time", flow_unit: flow_label},
             )
-            st.plotly_chart(flow_fig, use_container_width=True)
+            show_chart(flow_fig)
 
             surface_psi_fig = px.line(
                 subset_df,
@@ -1295,7 +1586,7 @@ if page == "Overview":
                 title="Surface Pressure (Subset Data)",
                 labels={"date_time": "Date and time", "surface_psi": "Surface PSI"},
             )
-            st.plotly_chart(surface_psi_fig, use_container_width=True)
+            show_chart(surface_psi_fig)
 
             surface_temperature_fig = px.line(
                 subset_df,
@@ -1304,7 +1595,7 @@ if page == "Overview":
                 title="Surface Temperature (Subset Data)",
                 labels={"date_time": "Date and time", "surface_temperature": "Surface Temperature"},
             )
-            st.plotly_chart(surface_temperature_fig, use_container_width=True)
+            show_chart(surface_temperature_fig)
         else:
             st.info("No subset flow data is available for this period.")
     
@@ -1325,12 +1616,13 @@ if page == "Overview":
         kpis = metrics.get("kpis", {})
         st.subheader("KPIs")
         st.write(kpis)
+        add_page_context("KPIs", json.dumps(kpis, default=str))
 
         ts = pd.DataFrame(metrics.get("timeseries", []))
         if not ts.empty:
             ts["timestamp"] = pd.to_datetime(ts["timestamp"])
             fig = px.line(ts, x="timestamp", y=[c for c in ["bhp","bht","injection_rate","pump_speed"] if c in ts.columns], title="Time Series")
-            st.plotly_chart(fig, use_container_width=True)
+            show_chart(fig)
 
 elif page == "Prediction":
     st.header("Bottom-Hole Conditions")
@@ -1404,7 +1696,7 @@ elif page == "Prediction":
                         "corrected_bottom_hole_pressure": "Corrected pressure",
                     },
                 )
-                st.plotly_chart(corrected_pressure_fig, use_container_width=True)
+                show_chart(corrected_pressure_fig)
 
             with chart_col2:
                 bottom_temperature_fig = px.line(
@@ -1414,7 +1706,7 @@ elif page == "Prediction":
                     title="Bottom-Hole Temperature (fulldata)",
                     labels={"date_time": "Date and time", "bht": "Temperature"},
                 )
-                st.plotly_chart(bottom_temperature_fig, use_container_width=True)
+                show_chart(bottom_temperature_fig)
         else:
             st.info("No fulldata records are available for this period.")
 
@@ -1447,10 +1739,16 @@ elif page == "Prediction":
         ):
             st.subheader(target_data.get("label", target_key.title()))
             st.write(f"Selected model: **{target_data.get('best_model', 'Unavailable')}**")
+            add_page_context(
+                "Prediction analysis",
+                f"{target_data.get('label', target_key)}: selected (best) model is "
+                f"{target_data.get('best_model', 'Unavailable')}; trained on "
+                f"{prediction_analysis.get('row_count', 0):,} PostgreSQL fulldata rows",
+            )
             metrics_df = pd.DataFrame(target_data.get("metrics", {})).T
             if not metrics_df.empty:
                 metrics_df.index.name = "Model"
-                st.dataframe(metrics_df, use_container_width=True)
+                show_table(metrics_df, f"{target_data.get('label', target_key)} model metrics")
 
             test_df = pd.DataFrame(target_data.get("test_predictions", []))
             future_df = pd.DataFrame(target_data.get("future_predictions", []))
@@ -1461,7 +1759,7 @@ elif page == "Prediction":
 
             test_df["timestamp"] = pd.to_datetime(test_df["timestamp"])
             with st.expander("Prediction results table"):
-                st.dataframe(test_df, use_container_width=True)
+                show_table(test_df, f"{target_data.get('label', target_key)} test predictions")
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
                 actual_predicted_fig = px.scatter(
@@ -1471,7 +1769,7 @@ elif page == "Prediction":
                     title=f"{target_data.get('label')}: Actual vs Predicted",
                     labels={"actual": "Actual", "predicted": "Predicted"},
                 )
-                st.plotly_chart(actual_predicted_fig, use_container_width=True)
+                show_chart(actual_predicted_fig)
             with chart_col2:
                 residual_fig = px.histogram(
                     test_df,
@@ -1480,7 +1778,7 @@ elif page == "Prediction":
                     title=f"{target_data.get('label')}: Residual Distribution",
                     labels={"residual": "Residual (actual - predicted)"},
                 )
-                st.plotly_chart(residual_fig, use_container_width=True)
+                show_chart(residual_fig)
 
             time_fig = px.line(
                 test_df,
@@ -1515,7 +1813,7 @@ elif page == "Prediction":
                     "Future forecast uses the selected model with the latest operating "
                     "conditions held constant for the next 24 recording intervals."
                 )
-            st.plotly_chart(time_fig, use_container_width=True)
+            show_chart(time_fig)
 
             if not importance_df.empty:
                 importance_fig = px.bar(
@@ -1526,7 +1824,7 @@ elif page == "Prediction":
                     title=f"Feature Importance: {target_data.get('label')}",
                     labels={"importance": "Importance", "feature": "Feature"},
                 )
-                st.plotly_chart(importance_fig, use_container_width=True)
+                show_chart(importance_fig)
 
 elif page == "Injection Optimization Simulator":
     st.header("Injection Optimization Simulator")
@@ -1585,6 +1883,18 @@ elif page == "Injection Optimization Simulator":
         with action_col:
             st.caption("The optimizer evaluates the selected flow range using the existing Prediction models.")
             run_optimizer = st.button("Run optimization", type="primary", key="optimizer_run")
+    add_page_context(
+        "Simulator inputs",
+        f"Mode: {selected_mode}; surface PSI {surface_psi}; annulus PSI {annulus_psi}; pump speed {pump_speed}; "
+        f"surface temperature {surface_temp} °F; temperature before triplex {temperature_before_triplex} °F; "
+        f"pressure before triplex {pressure_before_triplex}; flow search {flow_min}-{flow_max} BPM step {flow_step}; "
+        + (
+            f"maximum allowable BHT {limit} °F"
+            if mode == "temperature_control"
+            else f"maximum allowable CBHP {limit} psi"
+            + (f"; safety margin {safety_margin_pct}%" if mode == "safe_operation" else "")
+        ),
+    )
 
     if run_optimizer:
         if flow_max < flow_min:
@@ -1624,18 +1934,18 @@ elif page == "Injection Optimization Simulator":
                 f"The closest result is {closest['predicted_bht']:.2f} °F at {closest['flow_bpm']:.2f} BPM."
             )
             result_col1, result_col2 = st.columns(2)
-            result_col1.metric("Closest flow", f"{closest['flow_bpm']:.2f} BPM")
-            result_col2.metric("Closest predicted BHT", f"{closest['predicted_bht']:.2f} °F")
+            show_metric(result_col1, "Closest flow", f"{closest['flow_bpm']:.2f} BPM")
+            show_metric(result_col2, "Closest predicted BHT", f"{closest['predicted_bht']:.2f} °F")
         elif mode == "maximum_injection":
             result_col1, result_col2, result_col3 = st.columns(3)
-            result_col1.metric("Recommended flow", f"{result['recommended_flow_bpm']:.2f} BPM")
-            result_col2.metric("Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
-            result_col3.metric("Predicted BHT", f"{result['predicted_bht']:.2f} °F")
+            show_metric(result_col1, "Recommended flow", f"{result['recommended_flow_bpm']:.2f} BPM")
+            show_metric(result_col2, "Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
+            show_metric(result_col3, "Predicted BHT", f"{result['predicted_bht']:.2f} °F")
         elif mode == "safe_operation":
             result_col1, result_col2, result_col3 = st.columns(3)
-            result_col1.metric("Maximum safe flow", f"{result['recommended_flow_bpm']:.2f} BPM")
-            result_col2.metric("Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
-            result_col3.metric("Remaining pressure margin", f"{result['remaining_pressure_margin']:.2f} psi")
+            show_metric(result_col1, "Maximum safe flow", f"{result['recommended_flow_bpm']:.2f} BPM")
+            show_metric(result_col2, "Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
+            show_metric(result_col3, "Remaining pressure margin", f"{result['remaining_pressure_margin']:.2f} psi")
             st.caption(
                 f"Safe operating limit: {result['safe_operating_limit']:.2f} psi "
                 f"({result['safety_margin_pct']:.2f}% below the {result['maximum_allowable_cbhp']:.2f} psi maximum)."
@@ -1643,9 +1953,9 @@ elif page == "Injection Optimization Simulator":
         else:
             acceptable_df = pd.DataFrame(result["acceptable_results"])
             result_col1, result_col2, result_col3 = st.columns(3)
-            result_col1.metric("Acceptable flow range", f"{result['acceptable_flow_min_bpm']:.2f} - {result['acceptable_flow_max_bpm']:.2f} BPM")
-            result_col2.metric("CBHP range", f"{acceptable_df['predicted_cbhp'].min():.2f} - {acceptable_df['predicted_cbhp'].max():.2f} psi")
-            result_col3.metric("BHT limit", f"{result['bht_limit']:.2f} °F")
+            show_metric(result_col1, "Acceptable flow range", f"{result['acceptable_flow_min_bpm']:.2f} - {result['acceptable_flow_max_bpm']:.2f} BPM")
+            show_metric(result_col2, "CBHP range", f"{acceptable_df['predicted_cbhp'].min():.2f} - {acceptable_df['predicted_cbhp'].max():.2f} psi")
+            show_metric(result_col3, "BHT limit", f"{result['bht_limit']:.2f} °F")
             chart = px.line(
                 acceptable_df,
                 x="flow_bpm",
@@ -1654,10 +1964,15 @@ elif page == "Injection Optimization Simulator":
                 title="Acceptable operating conditions",
                 labels={"flow_bpm": "Flow (BPM)", "value": "Predicted value"},
             )
-            st.plotly_chart(chart, width="stretch")
-            st.dataframe(acceptable_df, hide_index=True, width="stretch")
+            show_chart(chart)
+            show_table(acceptable_df, "Acceptable operating conditions", hide_index=True)
         st.caption(f"CBHP model: {result['models']['cbhp']} | BHT model: {result['models']['bht']}")
+        add_page_context(
+            "Optimization result",
+            json.dumps({key: value for key, value in result.items() if key not in {"acceptable_results", "results"}}, default=str),
+        )
     elif not result:
+        add_page_context("Optimization result", "The optimizer has not been run yet for the selected mode.")
         st.info("Enter operating conditions and run an optimization mode to see recommendations.")
 
 elif page == "SEGY Analysis":
@@ -1740,12 +2055,12 @@ elif page == "SEGY Analysis":
 
                 st.subheader(f"Event {event_id} · {well} · channel {channel}")
                 kpi_cols = st.columns(6)
-                kpi_cols[0].metric("Event ID", str(event_id), border=True)
-                kpi_cols[1].metric("Magnitude", catalog_value("magnitude"), border=True)
-                kpi_cols[2].metric("Depth", catalog_value("depth", " m"), border=True)
-                kpi_cols[3].metric("Corner frequency", catalog_value("corner", " Hz"), border=True)
-                kpi_cols[4].metric("Date / time", event.get("date", "N/A"), border=True)
-                kpi_cols[5].metric("UTM East / North", f"{event.get('easting', 'N/A')} / {event.get('northing', 'N/A')}", border=True)
+                show_metric(kpi_cols[0], "Event ID", str(event_id), border=True)
+                show_metric(kpi_cols[1], "Magnitude", catalog_value("magnitude"), border=True)
+                show_metric(kpi_cols[2], "Depth", catalog_value("depth", " m"), border=True)
+                show_metric(kpi_cols[3], "Corner frequency", catalog_value("corner", " Hz"), border=True)
+                show_metric(kpi_cols[4], "Date / time", event.get("date", "N/A"), border=True)
+                show_metric(kpi_cols[5], "UTM East / North", f"{event.get('easting', 'N/A')} / {event.get('northing', 'N/A')}", border=True)
 
                 map_col, timeline_col = st.columns(2)
                 catalog_df = pd.DataFrame([{"event_id": event_number, **metadata} for event_number, metadata in EVENT_CATALOG.items()])
@@ -1757,13 +2072,13 @@ elif page == "SEGY Analysis":
                     map_fig.update_traces(marker_line_width=1.5, marker_line_color="#f2f8f6")
                     map_fig.update_layout(xaxis_title="UTM East (m)", yaxis_title="UTM North (m)")
                     style_segy_figure(map_fig, 360)
-                    st.plotly_chart(map_fig, width="stretch")
+                    show_chart(map_fig)
                 with timeline_col:
                     timeline_fig = px.scatter(catalog_df, x="date_time", y="depth", size="magnitude_size", color="selected", hover_name="event_id", color_discrete_map={True: "#f0a35b", False: "#70d7bf"}, title="Microseismic event timeline")
                     timeline_fig.update_yaxes(autorange="reversed", title="Depth (m)")
                     timeline_fig.update_xaxes(title="UTC date")
                     style_segy_figure(timeline_fig, 360)
-                    st.plotly_chart(timeline_fig, width="stretch")
+                    show_chart(timeline_fig)
 
                 waveform_col, spectrum_col = st.columns([1.35, 1])
                 with waveform_col:
@@ -1772,7 +2087,7 @@ elif page == "SEGY Analysis":
                     waveform_fig.add_trace(go.Scatter(x=samples_ms, y=filtered_trace, name=f"Filtered {low_hz:g}–{high_hz:g} Hz", line=dict(color="#70d7bf", width=1.5)))
                     waveform_fig.update_layout(title=f"Channel {channel} waveform", xaxis_title="Time (ms)", yaxis_title="Amplitude", legend=dict(orientation="h"))
                     style_segy_figure(waveform_fig, 390)
-                    st.plotly_chart(waveform_fig, width="stretch")
+                    show_chart(waveform_fig)
                 with spectrum_col:
                     spectrum_fig = go.Figure(go.Scatter(x=frequencies, y=spectrum, name="Amplitude spectrum", line=dict(color="#f0a35b", width=1.5)))
                     spectrum_fig.add_vline(x=dominant_frequency, line_dash="dash", line_color="#70d7bf", annotation_text=f"Dominant {dominant_frequency:.1f} Hz")
@@ -1780,13 +2095,13 @@ elif page == "SEGY Analysis":
                         spectrum_fig.add_vline(x=event["corner"], line_dash="dot", line_color="#ef7c7c", annotation_text=f"Catalogue corner {event['corner']} Hz")
                     spectrum_fig.update_layout(title="FFT spectrum", xaxis_title="Frequency (Hz)", yaxis_title="Amplitude", xaxis_range=[0, min(sample_rate_hz / 2, max(500, high_hz * 1.2))])
                     style_segy_figure(spectrum_fig, 390)
-                    st.plotly_chart(spectrum_fig, width="stretch")
+                    show_chart(spectrum_fig)
 
                 analysis_cols = st.columns(4)
-                analysis_cols[0].metric("Sampling rate", f"{sample_rate_hz:,.0f} Hz", border=True)
-                analysis_cols[1].metric("Duration", f"{duration_s:.2f} s", border=True)
-                analysis_cols[2].metric("SNR estimate", f"{snr_db:.1f} dB", border=True)
-                analysis_cols[3].metric("Channel RMS z-score", f"{rms_z:+.2f}", border=True)
+                show_metric(analysis_cols[0], "Sampling rate", f"{sample_rate_hz:,.0f} Hz", border=True)
+                show_metric(analysis_cols[1], "Duration", f"{duration_s:.2f} s", border=True)
+                show_metric(analysis_cols[2], "SNR estimate", f"{snr_db:.1f} dB", border=True)
+                show_metric(analysis_cols[3], "Channel RMS z-score", f"{rms_z:+.2f}", border=True)
 
                 st.subheader("DAS channel response")
                 channel_range = st.slider("DAS channel range", 1, trace_count, (1, trace_count))
@@ -1795,7 +2110,7 @@ elif page == "SEGY Analysis":
                 das_fig = go.Figure(go.Heatmap(x=samples_ms[::heatmap_stride], y=np.arange(channel_range[0], channel_range[1] + 1), z=selected_traces, zmin=-clipped, zmax=clipped, colorscale=[[0, "#123d58"], [0.5, "#081116"], [1, "#f0a35b"]], colorbar=dict(title="amplitude", thickness=12), hovertemplate="Channel %{y}<br>Time %{x:.0f} ms<br>Amplitude %{z:.2f}<extra></extra>"))
                 das_fig.update_layout(title="Channel vs time amplitude image", xaxis_title="Time (ms)", yaxis_title="DAS channel")
                 style_segy_figure(das_fig, 480)
-                st.plotly_chart(das_fig, width="stretch")
+                show_chart(das_fig)
 
                 compare_col, insight_col = st.columns([1.3, 1])
                 with compare_col:
@@ -1806,12 +2121,12 @@ elif page == "SEGY Analysis":
                         comparison_fig = px.scatter(comparison_df, x="depth", y="magnitude", size="corner", color="event_id", hover_name="event_id", title="Catalogued magnitude and depth")
                         comparison_fig.add_trace(go.Scatter(x=[event.get("depth")], y=[event.get("magnitude")], mode="markers", marker=dict(size=16, color="#f0a35b", symbol="star"), name="Selected event"))
                         style_segy_figure(comparison_fig, 350)
-                        st.plotly_chart(comparison_fig, width="stretch")
+                        show_chart(comparison_fig)
                     with comparison_tabs[1]:
                         corner_df = comparison_df.dropna(subset=["corner"])
                         corner_fig = px.scatter(corner_df, x="corner", y="magnitude", size="depth", color="event_id", hover_name="event_id", title="Catalogued magnitude and corner frequency")
                         style_segy_figure(corner_fig, 350)
-                        st.plotly_chart(corner_fig, width="stretch")
+                        show_chart(corner_fig)
                 with insight_col:
                     st.subheader("Analytical insights")
                     quality = "strong" if snr_db >= 10 else "moderate" if snr_db >= 3 else "limited"
@@ -1824,16 +2139,24 @@ elif page == "SEGY Analysis":
                     else:
                         st.markdown(f"**Frequency check:** the measured spectral peak is {dominant_frequency:.1f} Hz; no catalogue corner frequency is available for this event.")
                     st.caption("These indicators describe the recorded signal only. They do not establish CO₂ leakage or other geological conclusions.")
+                    add_page_context(
+                        "Analytical insights",
+                        f"Selected: event {event_id}, well {well}, file {selected_path.name}, channel {channel} of {trace_count}; "
+                        f"bandpass {low_hz:g}-{high_hz:g} Hz. Signal quality: {quality} (SNR {snr_db:.1f} dB, first-10%-window estimate). "
+                        f"Channel {channel} is {anomaly} (RMS z-score {rms_z:+.2f}). Dominant spectral peak {dominant_frequency:.1f} Hz; "
+                        f"catalogue corner frequency {event.get('corner', 'N/A')} Hz; peak absolute amplitude {peak_amplitude:,.3f}. "
+                        "These indicators describe the recorded signal only and do not establish CO2 leakage.",
+                    )
 
                 with st.expander("SEGY metadata and trace headers", icon=":material/description:"):
                     metadata_df = pd.DataFrame({"Field": ["Filename", "Number of traces", "Samples per trace", "Sampling interval", "Sampling rate", "Selected channel", "Depth context"], "Value": [selected_path.name, trace_count, len(bundle["samples"]), f"{bundle['sample_interval_us']:g} μs", f"{sample_rate_hz:,.0f} Hz", channel, f"Event catalogue depth: {event.get('depth', 'N/A')} m; channel depth is not encoded in the available headers"]})
                     metadata_df["Value"] = metadata_df["Value"].astype(str)
-                    st.dataframe(metadata_df, hide_index=True, width="stretch")
+                    show_table(metadata_df, "SEGY metadata", hide_index=True)
                     with segyio.open(str(selected_path), "r", ignore_geometry=True) as segy_file:
                         header = segy_file.header[channel - 1]
                         header_fields = {"TRACE_SEQUENCE_FILE": segyio.TraceField.TRACE_SEQUENCE_FILE, "TRACE_SEQUENCE_LINE": segyio.TraceField.TRACE_SEQUENCE_LINE, "FieldRecord": segyio.TraceField.FieldRecord, "TraceNumber": segyio.TraceField.TraceNumber, "CDP": segyio.TraceField.CDP, "CDP_TRACE": segyio.TraceField.CDP_TRACE, "GroupX": segyio.TraceField.GroupX, "GroupY": segyio.TraceField.GroupY, "SourceX": segyio.TraceField.SourceX, "SourceY": segyio.TraceField.SourceY, "DelayRecordingTime": segyio.TraceField.DelayRecordingTime, "TRACE_SAMPLE_INTERVAL": segyio.TraceField.TRACE_SAMPLE_INTERVAL}
                         headers_df = pd.DataFrame({"Header": list(header_fields), "Value": [int(header[field]) for field in header_fields.values()]})
-                    st.dataframe(headers_df, hide_index=True, width="stretch")
+                    show_table(headers_df, "SEGY trace headers", hide_index=True)
 
 elif page == "AI Chatbot":
     st.header("AI Chatbot")
@@ -1950,3 +2273,7 @@ elif page == "AI Chatbot":
                     use_container_width=True,
                     key=f"chat-chart-{source_key}-{len(st.session_state[history_key]) - 1}",
                 )
+
+# Floating "Ask AI" assistant on every page except the full AI Chatbot page.
+if page != "AI Chatbot":
+    render_page_assistant(page)
