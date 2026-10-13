@@ -5,6 +5,7 @@ from requests.exceptions import RequestException
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import hashlib
 import io
 import json
 import numpy as np
@@ -382,25 +383,74 @@ def metric_card(label: str, value: float, unit: str = "", color: str = "#0078D4"
             st.markdown(f"<p style='font-size: 36px; margin: 0; text-align: center;'>{icon}</p>", unsafe_allow_html=True)
 
 
+# Normal ranges from docs/knowledge_base/co2_injection_thresholds.md (sections 2-5).
+SURFACE_PRESSURE_NORMAL_PSI = (0, 1550)
+SURFACE_TEMPERATURE_NORMAL_F = (90, 120)
+BOTTOM_PRESSURE_NORMAL_PSI = (1071, 1980)
+BOTTOM_TEMPERATURE_NORMAL_F = (87.98, 120)
+TWIN_STATUS_STYLES = {
+    # status: (label, text/border colour, background, colour name)
+    "normal": ("Normal", "#22c55e", "#052e1a", "green"),
+    "warning": ("Check", "#f59e0b", "#3a2604", "orange"),
+    "alert": ("Alert", "#ef4444", "#3b0b0b", "red"),
+    "unknown": ("No data", "#75fff4", "#062b31", "teal"),
+}
+
+
+def reading_pair_status(pressure, pressure_bounds, temperature, temperature_bounds):
+    """Green if both readings are normal, orange if one is, red if neither is."""
+    def in_range(value, bounds):
+        return None if value is None or pd.isna(value) else bounds[0] <= float(value) <= bounds[1]
+
+    checks = [in_range(pressure, pressure_bounds), in_range(temperature, temperature_bounds)]
+    if None in checks:
+        return "unknown"
+    return {2: "normal", 1: "warning", 0: "alert"}[sum(checks)]
+
+
+def twin_callout_style(status):
+    _, color, background, _ = TWIN_STATUS_STYLES[status]
+    return f"border-color: {color}; background: {background}; color: {color};"
+
+
 def render_digital_twin(current_data: dict, flow_bpm=None):
     def display_value(value, unit="", decimals=0):
         if value is None or pd.isna(value):
             return "N/A"
         return f"{float(value):,.{decimals}f} {unit}".strip()
 
+    bottom_pressure_value = current_data.get("corrected_bottom_hole_pressure") or current_data.get("bhp")
+    surface_state = reading_pair_status(
+        current_data.get("surface_psi"), SURFACE_PRESSURE_NORMAL_PSI,
+        current_data.get("surface_temp"), SURFACE_TEMPERATURE_NORMAL_F,
+    )
+    bottom_state = reading_pair_status(
+        bottom_pressure_value, BOTTOM_PRESSURE_NORMAL_PSI,
+        current_data.get("bht"), BOTTOM_TEMPERATURE_NORMAL_F,
+    )
+    surface_label, bottom_label = TWIN_STATUS_STYLES[surface_state][0], TWIN_STATUS_STYLES[bottom_state][0]
+    surface_ranges = (
+        f"Normal: P_surf {SURFACE_PRESSURE_NORMAL_PSI[0]}-{SURFACE_PRESSURE_NORMAL_PSI[1]:,} PSI, "
+        f"T_surf {SURFACE_TEMPERATURE_NORMAL_F[0]}-{SURFACE_TEMPERATURE_NORMAL_F[1]} °F"
+    )
+    bottom_ranges = (
+        f"Normal: BHP {BOTTOM_PRESSURE_NORMAL_PSI[0]:,}-{BOTTOM_PRESSURE_NORMAL_PSI[1]:,} PSI, "
+        f"BHT {BOTTOM_TEMPERATURE_NORMAL_F[0]}-{BOTTOM_TEMPERATURE_NORMAL_F[1]} °F"
+    )
     surface_psi = display_value(current_data.get("surface_psi"), "PSI")
     surface_temp = display_value(current_data.get("surface_temp"), "°F", 1)
     annulus_psi = display_value(current_data.get("annulus_psi"), "PSI")
-    bottom_pressure = display_value(
-        current_data.get("corrected_bottom_hole_pressure") or current_data.get("bhp"), "PSI"
-    )
+    bottom_pressure = display_value(bottom_pressure_value, "PSI")
     bottom_temperature = display_value(current_data.get("bht"), "°F", 1)
     flow = display_value(flow_bpm, "BPM", 2)
     add_page_context(
         "Digital twin well schematic",
         f"Surface pressure {surface_psi}; surface temperature {surface_temp}; annulus pressure {annulus_psi}; "
         f"corrected bottom-hole pressure {bottom_pressure}; bottom-hole temperature {bottom_temperature}; "
-        f"flow rate {flow}; hydrostatic head +1,582 PSI; fluid: supercritical CO2",
+        f"flow rate {flow}; hydrostatic head +1,582 PSI; fluid: supercritical CO2. "
+        "Box colours: green = both readings normal, orange = one normal, red = neither normal. "
+        f"P_surf/T_surf box: {surface_label} ({TWIN_STATUS_STYLES[surface_state][3]}; {surface_ranges}). "
+        f"BHP/BHT box: {bottom_label} ({TWIN_STATUS_STYLES[bottom_state][3]}; {bottom_ranges}).",
     )
 
     st.markdown(
@@ -438,6 +488,7 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
         .sensor-one {{ top: 66px; }} .sensor-two {{ top: 136px; }} .sensor-three {{ top: 206px; }}
         .twin-callout {{ position: absolute; padding: .55rem .65rem; border: 1px solid #10d5ce; border-radius: 6px; background: #062b31; color: #75fff4; font-size: .68rem; line-height: 1.45; }}
         .twin-surface-callout {{ top: 25px; left: 56%; }}
+        .twin-status {{ display: block; margin-top: .2rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }}
         .twin-bottom-callout {{ right: 14%; bottom: 8px; }}
         .twin-annulus {{ top: 111px; left: 23%; color: #f0a62b; }}
         .twin-annulus::before {{ content: ''; position: absolute; top: 50%; right: -45px; width: 42px; border-top: 2px dotted #f0a62b; }}
@@ -465,8 +516,8 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
                 </div>
                 <div class="twin-well"><span class="twin-sensor sensor-one"></span><span class="twin-sensor sensor-two"></span><span class="twin-sensor sensor-three"></span></div>
                 <div class="twin-label twin-annulus">A-Annulus: {annulus_psi}</div>
-                <div class="twin-callout twin-surface-callout">P_surf: <b>{surface_psi}</b><br>T_surf: {surface_temp}</div>
-                <div class="twin-callout twin-bottom-callout">BHP: <b>{bottom_pressure}</b><br>BHT: {bottom_temperature}</div>
+                <div class="twin-callout twin-surface-callout" title="{surface_ranges}" style="{twin_callout_style(surface_state)}">P_surf: <b>{surface_psi}</b><br>T_surf: {surface_temp}<span class="twin-status">● {surface_label}</span></div>
+                <div class="twin-callout twin-bottom-callout" title="{bottom_ranges}" style="{twin_callout_style(bottom_state)}">BHP: <b>{bottom_pressure}</b><br>BHT: {bottom_temperature}<span class="twin-status">● {bottom_label}</span></div>
             </div>
             <div class="twin-footer"><span>Hydrostatic Head: <strong>+1,582 PSI</strong></span><span>Fluid: <strong>Supercritical CO₂</strong></span></div>
         </div>
@@ -1402,6 +1453,32 @@ def render_page_assistant(page):
                     )
 
 
+SEGY_INSIGHTS_REQUEST = (
+    "Write the 'Analytical insights' section for the SEGY Analysis page as 4 to 5 Markdown bullet points. "
+    "Start each bullet with a short bold heading followed by a colon (for example **Signal quality:**). "
+    "Interpret the measurements for a CCS monitoring engineer: signal quality, how this channel compares with the "
+    "other channels, the frequency content versus the catalogue corner frequency, how this event compares with the "
+    "rest of the event catalogue, and any data limitations. Quote the measured values. Use only the supplied "
+    "measurements, and do not conclude CO2 leakage or geological causes from these signal statistics. "
+    "Use the comparisons and classifications exactly as stated (higher/lower, above/below average, quality class); "
+    "do not recompute or reverse them. "
+    "Do not add a data source sentence."
+)
+
+
+def segy_analytical_insights(facts, fallback_lines):
+    """Return ``(markdown, answered_by)`` for the SEGY insights, generated by GPT and cached per selection."""
+    cache = st.session_state.setdefault("segy_insights_cache", {})
+    cache_key = hashlib.sha256(facts.encode("utf-8")).hexdigest()
+    if cache_key not in cache:
+        with st.spinner("Generating insights with OpenAI..."):
+            insights = call_llm(SEGY_INSIGHTS_REQUEST, "SEGY Analysis page signal measurements", facts)
+        if not insights:
+            return "\n\n".join(fallback_lines), "rule-based (GPT unavailable)"
+        cache[cache_key] = insights
+    return cache[cache_key], "GPT"
+
+
 def style_segy_figure(fig, height=460):
     fig.update_layout(
         height=height,
@@ -2131,22 +2208,78 @@ elif page == "SEGY Analysis":
                     st.subheader("Analytical insights")
                     quality = "strong" if snr_db >= 10 else "moderate" if snr_db >= 3 else "limited"
                     anomaly = "unusually energetic" if abs(rms_z) >= 2 else "within the channel energy distribution"
-                    st.markdown(f"**Signal quality:** {quality} by the simple first-10%-window SNR estimate ({snr_db:.1f} dB).")
-                    st.markdown(f"**Channel behavior:** channel {channel} is {anomaly} (RMS z-score {rms_z:+.2f}).")
                     if event.get("corner") is not None:
-                        difference = dominant_frequency - event["corner"]
-                        st.markdown(f"**Frequency check:** the measured spectral peak is {dominant_frequency:.1f} Hz; it differs from the catalogue corner frequency by {difference:+.1f} Hz. These are distinct quantities.")
+                        frequency_check = (
+                            f"the measured spectral peak is {dominant_frequency:.1f} Hz; it differs from the catalogue "
+                            f"corner frequency by {dominant_frequency - event['corner']:+.1f} Hz. These are distinct quantities."
+                        )
                     else:
-                        st.markdown(f"**Frequency check:** the measured spectral peak is {dominant_frequency:.1f} Hz; no catalogue corner frequency is available for this event.")
-                    st.caption("These indicators describe the recorded signal only. They do not establish CO₂ leakage or other geological conclusions.")
-                    add_page_context(
-                        "Analytical insights",
-                        f"Selected: event {event_id}, well {well}, file {selected_path.name}, channel {channel} of {trace_count}; "
-                        f"bandpass {low_hz:g}-{high_hz:g} Hz. Signal quality: {quality} (SNR {snr_db:.1f} dB, first-10%-window estimate). "
-                        f"Channel {channel} is {anomaly} (RMS z-score {rms_z:+.2f}). Dominant spectral peak {dominant_frequency:.1f} Hz; "
-                        f"catalogue corner frequency {event.get('corner', 'N/A')} Hz; peak absolute amplitude {peak_amplitude:,.3f}. "
-                        "These indicators describe the recorded signal only and do not establish CO2 leakage.",
+                        frequency_check = (
+                            f"the measured spectral peak is {dominant_frequency:.1f} Hz; "
+                            "no catalogue corner frequency is available for this event."
+                        )
+                    fallback_lines = [
+                        f"**Signal quality:** {quality} by the simple first-10%-window SNR estimate ({snr_db:.1f} dB).",
+                        f"**Channel behavior:** channel {channel} is {anomaly} (RMS z-score {rms_z:+.2f}).",
+                        f"**Frequency check:** {frequency_check}",
+                    ]
+
+                    catalogued = comparison_df.sort_values("magnitude", ascending=False).reset_index(drop=True)
+                    magnitude_rank = (
+                        f"{int(catalogued.index[catalogued['event_id'].eq(event_id)][0]) + 1} of {len(catalogued)} "
+                        "events with a catalogued magnitude (1 = largest)"
+                        if event.get("magnitude") is not None and catalogued["event_id"].eq(event_id).any()
+                        else "not ranked (no catalogued magnitude)"
                     )
+                    channel_rms_percentile = float((all_rms < all_rms[channel - 1]).mean() * 100)
+                    peak_time_ms = float(samples_ms[int(np.argmax(np.abs(raw_trace)))])
+                    # State comparisons explicitly so GPT interprets them rather than computing them.
+                    if abs(rms_z) >= 2:
+                        channel_energy_text = f"unusually {'high' if rms_z > 0 else 'low'} energy"
+                    elif rms_z > 0:
+                        channel_energy_text = "above the channel average but within the normal range"
+                    else:
+                        channel_energy_text = "below the channel average but within the normal range"
+                    if event.get("corner") is not None:
+                        corner_gap = dominant_frequency - event["corner"]
+                        corner_text = (
+                            f"the dominant frequency is {abs(corner_gap):.1f} Hz "
+                            f"{'higher' if corner_gap > 0 else 'lower'} than the catalogue corner frequency "
+                            f"({dominant_frequency:.1f} Hz vs {event['corner']} Hz)"
+                            if corner_gap
+                            else "the dominant frequency equals the catalogue corner frequency"
+                        )
+                    else:
+                        corner_text = "no catalogue corner frequency is available for comparison"
+                    insight_facts = "\n".join([
+                        f"File: {selected_path.name}; event {event_id}; well {well}; channel {channel} of {trace_count}.",
+                        f"Event catalogue entry: date {event.get('date', 'N/A')}, magnitude {event.get('magnitude', 'N/A')}, "
+                        f"depth {event.get('depth', 'N/A')} m, corner frequency {event.get('corner', 'N/A')} Hz, "
+                        f"UTM {event.get('easting', 'N/A')} E / {event.get('northing', 'N/A')} N.",
+                        f"Catalogue: {len(catalog_df)} events; magnitudes {comparison_df['magnitude'].min():.1f} to "
+                        f"{comparison_df['magnitude'].max():.1f}; depths {catalog_df['depth'].min():.0f} to "
+                        f"{catalog_df['depth'].max():.0f} m; this event's magnitude rank: {magnitude_rank}.",
+                        f"Recording: sampling rate {sample_rate_hz:,.0f} Hz, duration {duration_s:.2f} s, "
+                        f"{len(raw_trace):,} samples per trace.",
+                        f"Bandpass filter applied: {low_hz:g}-{high_hz:g} Hz.",
+                        f"Selected channel: peak absolute raw amplitude {peak_amplitude:,.3f} at {peak_time_ms:,.1f} ms; "
+                        f"filtered RMS {signal_rms:,.4f}; noise RMS (first 10% of the trace) {noise_rms:,.4f}; "
+                        f"SNR estimate {snr_db:.1f} dB, which is classed as {quality} signal quality "
+                        "(>=10 dB strong, 3-10 dB moderate, <3 dB limited)"
+                        + ("; the noise window is stronger than the filtered signal." if snr_db < 0 else "."),
+                        f"Channel energy: RMS z-score {rms_z:+.2f} versus all {trace_count} channels, i.e. "
+                        f"{channel_energy_text}; its RMS is higher than {channel_rms_percentile:.0f}% of channels and lower than "
+                        f"{100 - channel_rms_percentile:.0f}%; the most energetic channel is {int(np.argmax(all_rms)) + 1}.",
+                        f"Spectrum: dominant frequency above {max(low_hz, 1):g} Hz is {dominant_frequency:.1f} Hz; {corner_text}.",
+                        "The measurements describe the recorded DAS strain signal only.",
+                    ])
+                    insights, insights_by = segy_analytical_insights(insight_facts, fallback_lines)
+                    st.markdown(insights)
+                    st.caption(
+                        f"Answered by: {insights_by}. These indicators describe the recorded signal only. "
+                        "They do not establish CO₂ leakage or other geological conclusions."
+                    )
+                    add_page_context("Analytical insights", f"{insight_facts}\nInsights shown on the page:\n{insights}")
 
                 with st.expander("SEGY metadata and trace headers", icon=":material/description:"):
                     metadata_df = pd.DataFrame({"Field": ["Filename", "Number of traces", "Samples per trace", "Sampling interval", "Sampling rate", "Selected channel", "Depth context"], "Value": [selected_path.name, trace_count, len(bundle["samples"]), f"{bundle['sample_interval_us']:g} μs", f"{sample_rate_hz:,.0f} Hz", channel, f"Event catalogue depth: {event.get('depth', 'N/A')} m; channel depth is not encoded in the available headers"]})

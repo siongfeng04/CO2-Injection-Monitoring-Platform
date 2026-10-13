@@ -26,6 +26,7 @@ Alarm levels used by the digital twin while CO2 is being injected (Flow BPM > 1.
 | Bottom-Hole Pressure, BHP (psi) | 1,071 – 1,980 | 1,980 – 2,200 | > 2,200 | Same as CBHP; prefer CBHP for decisions |
 | Bottom-Hole Temperature, BHT (°F) | 87.98 – 120 | 120 – 125, or below 87.98 while injecting | > 125 | 87.98 °F = CO2 critical temperature; observed 95th percentile ≈ 121.5 °F; maximum ≈ 125.5 °F |
 | Surface (wellhead) injection pressure (psi) | ≤ 1,550 | 1,550 – 1,600 | > 1,600 | Maximum allowable surface injection pressure 1,600 psi |
+| Surface (wellhead) temperature (°F) | 90 – 120 | 80 – 90, or 120 – 130 | < 80 or > 130 | Observed while injecting: 5th percentile ≈ 92 °F, median ≈ 109 °F, 99.9th percentile ≈ 118 °F |
 | Annulus pressure (psi) | ≤ 2,000 | 2,000 – 2,500, or change > 200 psi in 10 min | > 2,500 | Annulus pressure change can mean a tubing or packer leak |
 | Flow rate (BPM) | 1.0 – 4.9 | 4.9 – 5.0 | > 5.0 | Design maximum injection rate 5.0 BPM (≈ 210 GPM) |
 | Pump speed (dashboard units) | ≤ 390 | 390 – 420 | > 420 | Normal running speed ≈ 361–377 |
@@ -86,7 +87,7 @@ Observed values while injecting: 1st percentile ≈ 72 °F, median ≈ 113 °F, 
 
 Note about the simulator: the Injection Optimization Simulator's "Maximum allowable BHT" field defaults to 125 °F, the project maximum BHT.
 
-## 5. Surface (Wellhead) Injection Pressure Thresholds
+## 5. Surface (Wellhead) Injection Pressure and Temperature Thresholds
 
 Surface pressure (Surface PSI) is the injection pressure at the wellhead after the triplex pump. Bottom-hole pressure is roughly surface pressure + pressure of the CO2 column in the well − friction losses in the tubing.
 
@@ -96,6 +97,18 @@ Surface pressure (Surface PSI) is the injection pressure at the wellhead after t
 - Critical: above 1,600 psi. Reduce the rate or stop the pump.
 
 Observed values while injecting: median ≈ 1,453 psi, 99th percentile ≈ 1,538 psi, maximum ≈ 1,565 psi.
+
+Surface (wellhead) temperature (Surface Temp. on the dashboard, °F) is the CO2 temperature after the triplex pump:
+
+- Normal: 90 – 120 °F. Observed while injecting: 5th percentile ≈ 92 °F, median ≈ 109 °F, 99.9th percentile ≈ 118 °F.
+- Warning: 80 – 90 °F or 120 – 130 °F. Check the pump and the CO2 supply temperature.
+- Critical: below 80 °F or above 130 °F.
+- When the well is not injecting, the surface temperature moves toward ambient temperature (often 50 – 60 °F in this dataset). A low reading during shut-in is not an alarm.
+
+Digital twin status colours (Overview page): each reading box turns green when both of its readings are in their Normal range, orange when only one is Normal, and red when neither is Normal.
+
+- P_surf / T_surf box: surface pressure ≤ 1,550 PSI and surface temperature 90 – 120 °F.
+- BHP / BHT box: corrected bottom-hole pressure 1,071 – 1,980 PSI and bottom-hole temperature 87.98 – 120 °F.
 
 A sudden increase in surface pressure at a constant flow rate can mean blockage near the wellbore (for example salt precipitation or hydrate formation) or lower injectivity. A sudden decrease at constant flow rate can mean a leak or a new flow path, and must be investigated.
 
