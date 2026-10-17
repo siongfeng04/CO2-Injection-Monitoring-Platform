@@ -1,0 +1,47 @@
+# CCS Digital Twin theme: PETRONAS emerald green as the primary colour,
+# PETRONAS secondary colours (purple, blue, yellow, lime) for chart series.
+# Both [theme.light] and [theme.dark] are defined, so users can switch between
+# Light, Dark and System in the app's Settings menu (top-right menu > Settings).
+
+[theme.light]
+primaryColor = "#00A19C"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F7F6"
+textColor = "#1C2B2A"
+borderColor = "#D3E4E2"
+linkColor = "#007A76"
+greenColor = "#00A19C"
+blueColor = "#20419A"
+violetColor = "#763F98"
+yellowColor = "#FDB924"
+orangeColor = "#E87722"
+redColor = "#D6342C"
+dataframeBorderColor = "#D3E4E2"
+dataframeHeaderBackgroundColor = "#F0F7F6"
+chartCategoricalColors = ["#00A19C", "#763F98", "#20419A", "#FDB924", "#BFD730", "#E87722", "#5B6770"]
+chartSequentialColors = ["#E6F6F5", "#C7EBE9", "#A3DEDB", "#7DD0CC", "#55C1BC", "#2DB2AC", "#00A19C", "#008C88", "#007470", "#005A57"]
+
+[theme.dark]
+primaryColor = "#00A19C"
+backgroundColor = "#0E1716"
+secondaryBackgroundColor = "#172322"
+textColor = "#E3EEEC"
+borderColor = "#2A3B3A"
+linkColor = "#2BC4BE"
+greenColor = "#2BC4BE"
+blueColor = "#5C7FE0"
+violetColor = "#A36BC4"
+yellowColor = "#FDB924"
+orangeColor = "#F0904A"
+redColor = "#F0605A"
+dataframeBorderColor = "#2A3B3A"
+dataframeHeaderBackgroundColor = "#172322"
+# Brighter variants of the same hues so series stay readable on the dark background.
+chartCategoricalColors = ["#2BC4BE", "#A36BC4", "#5C7FE0", "#FDB924", "#C9DF4F", "#F0904A", "#A7B1B8"]
+chartSequentialColors = ["#0F2A29", "#0D3B39", "#0B4D4A", "#08605C", "#05736E", "#008782", "#00A19C", "#2BC4BE", "#6ED8D3", "#B4ECE9"]
+
+[theme.light.sidebar]
+backgroundColor = "#F0F7F6"
+
+[theme.dark.sidebar]
+backgroundColor = "#121D1C"

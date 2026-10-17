@@ -322,6 +322,7 @@ def get_current_data(file_path="data/excel/combined_co2_data_only_file.xls", she
             "surface_psi": row.get("surface_psi"),
             "annulus_psi": row.get("annulus_psi"),
             "flow_bpm": row.get("flow_bpm"),
+            "flowrate_meter": row.get("flowrate_meter"),
             "bhp": row.get("bhp"),
             "corrected_bottom_hole_pressure": row.get("corrected_bottom_hole_pressure"),
             "bht": row.get("bht"),
@@ -413,7 +414,43 @@ def twin_callout_style(status):
     return f"border-color: {color}; background: {background}; color: {color};"
 
 
-def render_digital_twin(current_data: dict, flow_bpm=None):
+def flowrate_meter_bpm(value):
+    """The flowrate meter logged GPM on 20-21 Sep (readings ~42x the BPM rate) and BPM afterwards; the injection rate
+    never exceeds ~5 BPM, so a reading above 10 is a GPM value and is converted (42 gallons per barrel)."""
+    if value is None or pd.isna(value):
+        return None
+    value = float(value)
+    return value / 42 if value > 10 else value
+
+
+def flowrate_meter_display(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+    value = float(value)
+    if value > 10:
+        return f"{value:,.0f} GPM ({value / 42:.2f} BPM)"
+    return f"{value:.2f} BPM"
+
+
+def twin_flow_animation(flow_bpm):
+    """CSS for the dots in the wellbore: they stream down while CO2 is flowing, faster at higher flow, and stay still
+    when the flow is unknown or zero."""
+    if not flow_bpm or flow_bpm <= 0:
+        return ""
+    seconds = min(max(9.0 / flow_bpm, 1.2), 9.0)  # ~1.8 s per trip at 5 BPM, slower as flow drops
+    # One line: a line break here would break the indentation st.markdown strips from the surrounding HTML.
+    return (
+        f".twin-sensor {{ top: 22px; animation: twin-flow-down {seconds:.2f}s linear infinite; "
+        "box-shadow: 0 0 6px rgba(217, 245, 239, .9); } "
+        f".sensor-two {{ animation-delay: -{seconds / 3:.2f}s; }} .sensor-three {{ animation-delay: -{2 * seconds / 3:.2f}s; }} "
+        "@keyframes twin-flow-down { 0% { transform: translateY(0); opacity: 0; } 10% { opacity: 1; } "
+        "90% { opacity: 1; } 100% { transform: translateY(270px); opacity: 0; } } "
+        "@media (prefers-reduced-motion: reduce) { .twin-sensor { animation: none; } "
+        ".sensor-one { top: 66px; } .sensor-two { top: 136px; } .sensor-three { top: 206px; } }"
+    )
+
+
+def render_digital_twin(current_data: dict):
     def display_value(value, unit="", decimals=0):
         if value is None or pd.isna(value):
             return "N/A"
@@ -442,12 +479,12 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
     annulus_psi = display_value(current_data.get("annulus_psi"), "PSI")
     bottom_pressure = display_value(bottom_pressure_value, "PSI")
     bottom_temperature = display_value(current_data.get("bht"), "°F", 1)
-    flow = display_value(flow_bpm, "BPM", 2)
+    flow = flowrate_meter_display(current_data.get("flowrate_meter"))
     add_page_context(
         "Digital twin well schematic",
         f"Surface pressure {surface_psi}; surface temperature {surface_temp}; annulus pressure {annulus_psi}; "
         f"corrected bottom-hole pressure {bottom_pressure}; bottom-hole temperature {bottom_temperature}; "
-        f"flow rate {flow}; hydrostatic head +1,582 PSI; fluid: supercritical CO2. "
+        f"flow (flowrate meter) {flow};hydrostatic head +1,582 PSI; fluid: supercritical CO2. "
         "Box colours: green = both readings normal, orange = one normal, red = neither normal. "
         f"P_surf/T_surf box: {surface_label} ({TWIN_STATUS_STYLES[surface_state][3]}; {surface_ranges}). "
         f"BHP/BHT box: {bottom_label} ({TWIN_STATUS_STYLES[bottom_state][3]}; {bottom_ranges}).",
@@ -486,6 +523,7 @@ def render_digital_twin(current_data: dict, flow_bpm=None):
         .twin-well::after {{ content: ''; position: absolute; top: -11px; left: 12px; width: 14px; height: 14px; border-radius: 50%; background: #10b9ad; }}
         .twin-sensor {{ position: absolute; left: 17px; width: 7px; height: 7px; border-radius: 50%; background: #d9f5ef; }}
         .sensor-one {{ top: 66px; }} .sensor-two {{ top: 136px; }} .sensor-three {{ top: 206px; }}
+        {twin_flow_animation(flowrate_meter_bpm(current_data.get("flowrate_meter")))}
         .twin-callout {{ position: absolute; padding: .55rem .65rem; border: 1px solid #10d5ce; border-radius: 6px; background: #062b31; color: #75fff4; font-size: .68rem; line-height: 1.45; }}
         .twin-surface-callout {{ top: 25px; left: 56%; }}
         .twin-status {{ display: block; margin-top: .2rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }}
@@ -644,6 +682,100 @@ def build_segy_file_index(segy_dir):
     return files
 
 
+# Event detection across SEGY files: classic STA/LTA (short-term / long-term average energy).
+# A real microseismic arrival makes many DAS channels trigger at about the same time, while
+# noise triggers scattered channels, so files are classified by the share of channels that
+# trigger together in one 100 ms window. Thresholds were calibrated on the 35 project files.
+STA_LTA_SHORT_MS = 50
+STA_LTA_LONG_MS = 500
+STA_LTA_TRIGGER = 3.0
+COHERENCE_WINDOW_MS = 100
+CLEAR_EVENT_SHARE = 0.20
+POSSIBLE_EVENT_SHARE = 0.05
+SEGY_DETECTION_CACHE = Path("data/segy/.event_detection_cache.json")
+
+
+def _sta_lta(energy, short, long):
+    """Trailing-window STA/LTA ratio for each row of ``energy`` (squared amplitude)."""
+    cumulative = np.concatenate([np.zeros((energy.shape[0], 1)), np.cumsum(energy, axis=1)], axis=1)
+    index = np.arange(long, energy.shape[1])
+    short_mean = (cumulative[:, index + 1] - cumulative[:, index + 1 - short]) / short
+    long_mean = (cumulative[:, index + 1] - cumulative[:, index + 1 - long]) / long
+    return short_mean / np.maximum(long_mean, 1e-12), index
+
+
+def detect_segy_event(file_path):
+    """Summarise how strongly one SEGY file shows a coherent microseismic arrival."""
+    # Read directly rather than through the cached loader, so a full scan does not keep every file in memory.
+    with segyio.open(str(file_path), "r", ignore_geometry=True) as segy_file:
+        traces = np.nan_to_num(np.asarray(segy_file.trace.raw[:], dtype=np.float64))
+        sample_ms = float(segyio.dt(segy_file)) / 1000.0
+    limit = float(np.percentile(np.abs(traces), 99.9) * 10)
+    if limit > 0:
+        traces = np.clip(traces, -limit, limit)
+    traces -= traces.mean(axis=1, keepdims=True)
+    short, long = int(STA_LTA_SHORT_MS / sample_ms), int(STA_LTA_LONG_MS / sample_ms)
+    ratio, index = _sta_lta(traces ** 2, short, long)
+    peak = ratio.max(axis=1)
+    peak_ms = index[ratio.argmax(axis=1)] * sample_ms
+    triggered = peak >= STA_LTA_TRIGGER
+    coherent_share, arrival_ms, coherent_channels = 0.0, None, (None, None)
+    if triggered.any():
+        bins = np.arange(0, traces.shape[1] * sample_ms + COHERENCE_WINDOW_MS, COHERENCE_WINDOW_MS)
+        counts, _ = np.histogram(peak_ms[triggered], bins=bins)
+        best = int(counts.argmax())
+        coherent_share = float(counts[best] / traces.shape[0])
+        arrival_ms = float(bins[best] + COHERENCE_WINDOW_MS / 2)
+        in_window = triggered & (np.abs(peak_ms - arrival_ms) <= COHERENCE_WINDOW_MS / 2)
+        channels = np.flatnonzero(in_window) + 1
+        coherent_channels = (int(channels.min()), int(channels.max())) if channels.size else (None, None)
+    if coherent_share >= CLEAR_EVENT_SHARE:
+        classification = "Clear event"
+    elif coherent_share >= POSSIBLE_EVENT_SHARE:
+        classification = "Possible event"
+    else:
+        classification = "No clear event"
+    return {
+        "channels": int(traces.shape[0]),
+        "duration_s": float(traces.shape[1] * sample_ms / 1000),
+        "median_peak_sta_lta": float(np.median(peak)),
+        "triggered_share": float(triggered.mean()),
+        "coherent_share": coherent_share,
+        "arrival_ms": arrival_ms,
+        "coherent_channel_range": coherent_channels,
+        "classification": classification,
+    }
+
+
+def segy_event_summary(segy_dir=Path("data/segy")):
+    """Detection summary for every SEGY file, cached on disk and recomputed only for changed files."""
+    try:
+        cache = json.loads(SEGY_DETECTION_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    index = sorted(build_segy_file_index(segy_dir).items(), key=lambda item: item[0])
+    missing = [
+        path for _, path in index
+        if cache.get(path.name, {}).get("signature") != [path.stat().st_size, path.stat().st_mtime]
+    ]
+    if missing:
+        progress = st.progress(0.0, text=f"Scanning {len(missing)} SEGY files for events (one-time)...")
+        for done, path in enumerate(missing, start=1):
+            cache[path.name] = {"signature": [path.stat().st_size, path.stat().st_mtime], **detect_segy_event(path)}
+            progress.progress(done / len(missing), text=f"Scanning SEGY files for events: {done}/{len(missing)}")
+        progress.empty()
+        try:
+            SEGY_DETECTION_CACHE.write_text(json.dumps(cache), encoding="utf-8")
+        except OSError:
+            pass
+    rows = []
+    for (event_id, well), path in index:
+        catalog = EVENT_CATALOG.get(event_id, {})
+        rows.append({"event": event_id, "well": well, "file": path.name, **cache[path.name],
+                     "magnitude": catalog.get("magnitude"), "depth_m": catalog.get("depth"), "date": catalog.get("date")})
+    return pd.DataFrame(rows)
+
+
 FULLDATA_CHAT_COLUMNS = {
     "corrected bottom hole pressure": "corrected_bottom_hole_pressure",
     "corrected bhp": "corrected_bottom_hole_pressure",
@@ -777,9 +909,10 @@ KNOWLEDGE_QUESTION_TERMS = [
     "regulation", "regulatory", "epa", "class vi", "fracture", "maip", "masip", "supercritical",
     "critical point", "phase", "shut in", "shutdown", "shut down", "what should", "what to do",
     "action", "procedure", "response", "integrity", "leak", "cavitation", "saturation",
-    "purity", "impurit", "define", "definition", "meaning of", "what is a", "what does",
-    "knowledge base", "document",
+    "purity", "impurit", "knowledge base",
 ]
+# Only domain terms trigger a knowledge-base lookup. Generic phrases such as "what does" or
+# "meaning of" were removed: they matched ordinary data questions ("what does the percentage mean?").
 
 
 def is_knowledge_question(question):
@@ -793,6 +926,12 @@ def fetch_knowledge(question, top_k=4):
         resp = requests.get(api_url("/api/knowledge/search"), params={"q": question, "top_k": top_k}, timeout=60)
         resp.raise_for_status()
         return resp.json().get("results", [])
+    except requests.ConnectionError:
+        st.warning(
+            f"The FastAPI backend at {BACKEND_URL} is not running, so the CO2 Injection Knowledge Base was not used. "
+            "Start it with: uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+        )
+        return []
     except (RequestException, ValueError) as exc:
         hint = " Restart the FastAPI backend so it loads the knowledge-base endpoint." if "404" in str(exc) else ""
         st.warning(f"CO2 Injection Knowledge Base is unavailable, so thresholds were not used. ({exc}){hint}")
@@ -1306,11 +1445,95 @@ def build_segy_chat_context(question, selected_path):
     return "\n\n".join(summary), chart, None
 
 
-def render_segy_chat_answer(question, selected_path, history=None):
+SEGY_CLASS_COLORS = {"Clear event": "#16a34a", "Possible event": "#f59e0b", "No clear event": "#94a3b8"}
+
+
+def build_all_segy_chat_context(question):
+    """Return ``(local_answer, chart, knowledge_results)`` summarising event detection across every SEGY file."""
+    knowledge_results = fetch_knowledge(question) if is_knowledge_question(question) else []
+    summary = segy_event_summary()
+    if summary.empty:
+        return "No SEGY files were found in data/segy.", None, knowledge_results
+    counts = summary["classification"].value_counts()
+    lines = [
+        "Data source: all SEGY files in data/segy",
+        f"Files analysed: {len(summary)} ({summary['event'].nunique()} events x {summary['well'].nunique()} wells: "
+        f"{', '.join(sorted(summary['well'].unique()))}).",
+        "Detection method: STA/LTA (short-term 50 ms / long-term 500 ms energy ratio) on every DAS channel; a channel "
+        "triggers when the ratio reaches 3. The coherent share is the fraction of all channels that trigger within the "
+        "same 100 ms window - a real microseismic arrival triggers many channels together, noise does not. "
+        "Clear event: coherent share >= 20%. Possible event: 5-20%. No clear event: < 5%.",
+        "All files are named after catalogued events; the classification says how clearly each well's recording "
+        "shows that event, not whether the event happened.",
+        f"Summary: {counts.get('Clear event', 0)} clear, {counts.get('Possible event', 0)} possible, "
+        f"{counts.get('No clear event', 0)} with no clear event.",
+        "",
+        "Complete lists by classification (when asked which files have an event, include every file in these lists "
+        "and state the counts; do not omit any):",
+    ]
+    for classification in SEGY_CLASS_COLORS:
+        group = summary[summary["classification"] == classification].sort_values(["event", "well"])
+        files = "; ".join(
+            f"Event {r.event} {r.well} ({r.file}, {r.coherent_share:.1%})" for r in group.itertuples()
+        ) or "none"
+        lines.append(f"- {classification} ({len(group)} files): {files}")
+    lines += [
+        "",
+        "Per file (event | well | file | classification | coherent share | arrival time | channels triggering together | median peak STA/LTA):",
+    ]
+    for row in summary.sort_values(["event", "well"]).itertuples():
+        arrival = f"{row.arrival_ms:,.0f} ms" if row.arrival_ms is not None and not pd.isna(row.arrival_ms) else "none"
+        low, high = row.coherent_channel_range if row.coherent_channel_range else (None, None)
+        channel_text = f"{low}-{high} of {row.channels}" if low else f"none of {row.channels}"
+        lines.append(
+            f"- Event {row.event} | {row.well} | {row.file} | {row.classification} | {row.coherent_share:.1%} | "
+            f"{arrival} | {channel_text} | {row.median_peak_sta_lta:.2f}"
+        )
+    lines += ["", "Per event across wells (catalogue magnitude, depth; wells with a clear event and their arrival times):"]
+    for event_id, group in summary.groupby("event"):
+        clear = group[group["classification"] == "Clear event"]
+        arrivals = ", ".join(f"{r.well} {r.arrival_ms:,.0f} ms" for r in clear.itertuples()) or "none"
+        best = group.loc[group["coherent_share"].idxmax()]
+        lines.append(
+            f"- Event {event_id} (magnitude {group['magnitude'].iloc[0]}, depth {group['depth_m'].iloc[0]} m, "
+            f"{group['date'].iloc[0]}): clear on {len(clear)} of {len(group)} wells ({arrivals}); "
+            f"strongest in {best['well']} ({best['coherent_share']:.1%})."
+        )
+
+    chart_data = summary.assign(
+        label=summary["event"].map(lambda event: f"Event {event}"),
+        coherent_pct=summary["coherent_share"] * 100,
+    )
+    chart = px.bar(
+        chart_data,
+        x="label",
+        y="coherent_pct",
+        color="classification",
+        pattern_shape="well",
+        barmode="group",
+        color_discrete_map=SEGY_CLASS_COLORS,
+        category_orders={"classification": list(SEGY_CLASS_COLORS)},
+        hover_data={"file": True, "well": True, "arrival_ms": ":.0f", "coherent_pct": ":.1f", "label": False},
+        title="Event detection across all SEGY files (share of channels triggering together)",
+        labels={"label": "Event", "coherent_pct": "Coherent channels (%)", "classification": "Detection", "well": "Well"},
+    )
+    chart.add_hline(y=CLEAR_EVENT_SHARE * 100, line_dash="dash", line_color=SEGY_CLASS_COLORS["Clear event"],
+                    annotation_text="Clear event (20%)", annotation_position="top left")
+    chart.add_hline(y=POSSIBLE_EVENT_SHARE * 100, line_dash="dot", line_color=SEGY_CLASS_COLORS["Possible event"],
+                    annotation_text="Possible (5%)", annotation_position="top left")
+    return "\n".join(lines), chart, knowledge_results
+
+
+def render_segy_chat_answer(question, selected_path, history=None, all_files=False):
     """Answer every SEGY question with GPT; returns ``(answer, chart, answered_by, sources)``."""
-    local_answer, chart, knowledge_results = build_segy_chat_context(question, selected_path)
-    answer, answered_by = answer_with_gpt(question, "SEGY Files", local_answer, history, knowledge_results)
-    return answer, chart, answered_by, answer_sources("SEGY Files", local_answer, knowledge_results)
+    if all_files:
+        source = "SEGY Files (all files)"
+        local_answer, chart, knowledge_results = build_all_segy_chat_context(question)
+    else:
+        source = "SEGY Files"
+        local_answer, chart, knowledge_results = build_segy_chat_context(question, selected_path)
+    answer, answered_by = answer_with_gpt(question, source, local_answer, history, knowledge_results)
+    return answer, chart, answered_by, answer_sources(source, local_answer, knowledge_results)
 
 
 PAGE_ASSISTANT_SUGGESTIONS = {
@@ -1545,12 +1768,351 @@ def render_simulated_clock():
     st.markdown(
         f"""
         <div style='text-align: right; padding: .35rem 0 .15rem; line-height: 1.15;'>
-            <div style='color: #8da0aa; font-size: .72rem; letter-spacing: .04em; text-transform: uppercase;'>Simulated time</div>
-            <div style='color: #f2f7f6; font-size: 1.25rem; font-weight: 600; white-space: nowrap;'>{simulated_time}</div>
+            <div style='color: {BRAND_GREY}; font-size: .72rem; letter-spacing: .04em; text-transform: uppercase;'>Simulated time</div>
+            <div style='color: {BRAND_GREEN_DARK}; font-size: 1.25rem; font-weight: 600; white-space: nowrap;'>{simulated_time}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+# Prediction page -----------------------------------------------------------------------------
+# Colours follow the PETRONAS theme in .streamlit/config.toml: emerald green for what the page is
+# about (predictions, the current value), a neutral grey for context (history, actual readings).
+# The script reruns on every interaction, so these follow the viewer's Light/Dark setting.
+DARK_MODE = getattr(st.context.theme, "type", None) == "dark"
+BRAND_GREEN = "#2BC4BE" if DARK_MODE else "#00A19C"
+BRAND_GREEN_DARK = "#6ED8D3" if DARK_MODE else "#007A76"
+BRAND_GREY = "#A7B1B8" if DARK_MODE else "#5B6770"
+BRAND_RED = "#F0605A" if DARK_MODE else "#D6342C"
+PREDICTION_TARGETS = {
+    "pressure": {
+        "label": "Corrected bottom-hole pressure", "short": "CBHP", "unit": "psi",
+        "column": "corrected_bottom_hole_pressure", "normal": (1071.0, 1980.0), "critical": 2200.0,
+    },
+    "temperature": {
+        "label": "Bottom-hole temperature", "short": "BHT", "unit": "°F",
+        "column": "bht", "normal": (87.98, 120.0), "critical": 125.0,
+    },
+}
+FEATURE_BASE_LABELS = {
+    "surface_temp": "Surface temperature",
+    "surface_psi": "Surface pressure",
+    "annulus_psi": "Annulus pressure",
+    "flowrate_meter": "Flowrate meter",
+    "flow_bpm": "Flow rate",
+    "temperature_before_triplex": "Pump-inlet temperature",
+    "pressure_before_triplex": "Pump-inlet pressure",
+    "injecting": "Injecting (yes/no)",
+    "minutes_injecting": "Minutes injecting",
+    "minutes_shut_in": "Minutes shut in",
+    "injected_volume_bbl": "Injected volume so far",
+    "cold_dose": "Cold CO2 dose",
+}
+
+
+def friendly_feature(name):
+    """Readable label for a model input, e.g. flow_bpm_ewm120 -> 'Flow rate (2-hour memory)'."""
+    match = re.match(r"^(.*)_(30min_mean|ewm(\d+))$", name)
+    if not match:
+        return FEATURE_BASE_LABELS.get(name, name.replace("_", " ").capitalize())
+    base = FEATURE_BASE_LABELS.get(match.group(1), match.group(1).replace("_", " "))
+    if match.group(2) == "30min_mean":
+        return f"{base} (30-min average)"
+    minutes = int(match.group(3))
+    span = f"{minutes // 60}-hour" if minutes >= 60 else f"{minutes}-min"
+    return f"{base} ({span} memory)"
+
+
+def condition_status(spec, value, injecting):
+    """Return (label, badge colour, icon) for a bottom-hole reading against the knowledge-base levels."""
+    low, high = spec["normal"]
+    if value > spec["critical"]:
+        return "Critical", "red", ":material/error:"
+    if value > high:
+        return "Warning", "orange", ":material/warning:"
+    if value < low:
+        if injecting:
+            return "Warning", "orange", ":material/warning:"
+        return "Shut in", "gray", ":material/pause_circle:"
+    return "Normal", "green", ":material/check_circle:"
+
+
+def style_prediction_figure(fig, height=300, unified_hover=True):
+    fig.update_layout(
+        height=height,
+        margin=dict(l=8, r=8, t=48, b=8),
+        title=dict(font=dict(size=14)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1, title_text=""),
+        hovermode="x unified" if unified_hover else "closest",
+    )
+    fig.update_xaxes(showgrid=False, title_text="")
+    return fig
+
+
+def optimizer_flow_chart(result):
+    """Predicted CBHP across the searched flow range, with its error margin, the limit and the recommended flow."""
+    curve = pd.DataFrame(result["results"])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=curve["flow_bpm"], y=curve["predicted_cbhp_upper"], mode="lines", name=f"+ {result.get('interval_quantile', 0.9):.0%} margin",
+        line=dict(color=BRAND_GREEN, width=0), hovertemplate="%{y:,.1f} psi<extra>upper</extra>", showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=curve["flow_bpm"], y=curve["predicted_cbhp"], mode="lines+markers", name="Predicted CBHP",
+        line=dict(color=BRAND_GREEN, width=2), fill="tonexty", fillcolor="rgba(0,161,156,0.12)",
+        hovertemplate="%{y:,.1f} psi<extra>predicted</extra>",
+    ))
+    fig.add_hline(y=result["cbhp_limit"], line_dash="dash", line_color=BRAND_RED, line_width=1,
+                  annotation_text=f"Limit {result['cbhp_limit']:,.0f} psi", annotation_position="top left")
+    fig.add_vline(x=result["recommended_flow_bpm"], line_color=BRAND_GREEN_DARK, line_width=1.5,
+                  annotation_text=f"Recommended {result['recommended_flow_bpm']:.2f} BPM", annotation_position="bottom right")
+    if result.get("current_flow_bpm") is not None:
+        fig.add_vline(x=result["current_flow_bpm"], line_dash="dot", line_color=BRAND_GREY, line_width=1,
+                      annotation_text=f"Now {result['current_flow_bpm']:.2f} BPM", annotation_position="top right")
+    style_prediction_figure(fig, height=340)
+    fig.update_layout(title_text="Predicted CBHP by flow rate (shaded: 90% error margin)")
+    fig.update_xaxes(title_text="Flow rate (BPM)")
+    fig.update_yaxes(title_text="CBHP (psi)")
+    return fig
+
+
+def bottom_hole_trend_chart(df, spec):
+    """History of one bottom-hole reading with its normal band shaded and the critical level marked."""
+    low, high = spec["normal"]
+    fig = go.Figure(go.Scattergl(
+        x=df["date_time"], y=df[spec["column"]], mode="lines", name=spec["short"],
+        line=dict(color=BRAND_GREEN, width=1.6),
+        hovertemplate=f"%{{y:,.1f}} {spec['unit']}<extra></extra>",
+    ))
+    fig.add_hrect(y0=low, y1=high, fillcolor=BRAND_GREEN, opacity=0.07, line_width=0)
+    fig.add_hline(y=spec["critical"], line_dash="dash", line_color=BRAND_RED, line_width=1,
+                  annotation_text=f"Critical {spec['critical']:,.0f} {spec['unit']}",
+                  annotation_position="bottom right", annotation_font=dict(size=11, color=BRAND_RED))
+    # Fit the axis to the readings and the critical line, not to the whole normal band,
+    # so the history is not squashed flat by the lower limit.
+    values = df[spec["column"]]
+    span_low, span_high = float(values.min()), max(float(values.max()), spec["critical"])
+    padding = (span_high - span_low) * 0.08 or 1.0
+    fig.update_yaxes(range=[span_low - padding, span_high + padding])
+    fig.update_layout(title_text=f"History ({spec['unit']}) · shaded band = normal range", showlegend=False)
+    return style_prediction_figure(fig, height=280)
+
+
+def outlook_chart(test_df, future_df, spec, anchor_time, hours=3):
+    """The last few hours of readings in grey, then the next-hour projection and its error band in green."""
+    history = test_df[test_df["timestamp"] >= anchor_time - pd.Timedelta(hours=hours)]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=history["timestamp"], y=history["actual"], mode="lines", name="Measured",
+        line=dict(color=BRAND_GREY, width=1.6),
+        hovertemplate=f"%{{y:,.1f}} {spec['unit']}<extra>Measured</extra>",
+    ))
+    if {"lower", "upper"} <= set(future_df.columns):
+        fig.add_trace(go.Scatter(x=future_df["timestamp"], y=future_df["upper"], mode="lines",
+                                 line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(
+            x=future_df["timestamp"], y=future_df["lower"], mode="lines", line=dict(width=0),
+            fill="tonexty", fillcolor="rgba(0, 161, 156, 0.16)", name="90% error band", hoverinfo="skip",
+        ))
+    fig.add_trace(go.Scatter(
+        x=future_df["timestamp"], y=future_df["predicted"], mode="lines", name="Projection",
+        line=dict(color=BRAND_GREEN_DARK, width=2.6, dash="dash"),
+        hovertemplate=f"%{{y:,.1f}} {spec['unit']}<extra>Projection</extra>",
+    ))
+    fig.add_vline(x=anchor_time, line_dash="dot", line_color=BRAND_GREY, line_width=1)
+    fig.add_annotation(x=anchor_time, y=0, yref="paper", text="Latest reading ", showarrow=False,
+                       xanchor="right", yanchor="bottom", font=dict(size=11, color=BRAND_GREY))
+    fig.update_layout(title_text=f"{spec['short']}: last {hours} hours and next hour ({spec['unit']})")
+    return style_prediction_figure(fig, height=300)
+
+
+def render_prediction_outlook(target_key, outlook_target, history_df):
+    """Outlook card for one target: projection from /api/prediction/outlook, history = readings up to the simulated time."""
+    spec = PREDICTION_TARGETS[target_key]
+    unit = spec["unit"]
+    forecast = outlook_target.get("forecast") or {}
+    horizons = forecast.get("horizons") or []
+    test_df = history_df
+    future_df = pd.DataFrame(outlook_target.get("future_predictions", []))
+    with st.container(border=True):
+        live = forecast.get("method") == "live"
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f"**{spec['label']}**")
+            st.space("stretch")
+            st.badge(
+                "Live-gauge model" if live else "Conditions held constant",
+                color="green" if live else "gray",
+                icon=":material/insights:" if live else ":material/pause:",
+                help=forecast.get("assumption"),
+            )
+        if not horizons or test_df.empty or future_df.empty:
+            st.info("No projection is available for this target yet.", icon=":material/info:")
+            return
+        anchor_value = forecast.get("anchor_value")
+        for horizon_column, horizon in zip(st.columns(len(horizons)), horizons):
+            show_metric(
+                horizon_column,
+                f"In {horizon['minutes']} min ({unit})",
+                f"{horizon['predicted']:,.1f}",
+                delta=f"{horizon['predicted'] - anchor_value:+,.1f} vs now",
+                delta_color="off",
+                help=f"90% of errors fall within ± {horizon['band']:.1f} {unit} at this horizon.",
+            )
+        future_df["timestamp"] = pd.to_datetime(future_df["timestamp"])
+        show_chart(outlook_chart(test_df, future_df, spec, pd.to_datetime(forecast["starts_after"])))
+        last = horizons[-1]
+        if live and forecast.get("trend_unavailable"):
+            st.caption(
+                "The recent trend could not be read around this reading (a gap in the logger, or the start of a "
+                "recording period), so this outlook assumes the value stays the same."
+            )
+        elif live and last.get("improvement_pct") is not None:
+            st.caption(
+                f"At +{last['minutes']} min this model is {last['improvement_pct']:.0f}% more accurate than assuming "
+                f"{spec['short']} stays the same ({last['model_mae']:.2f} vs {last['persistence_mae']:.2f} {unit} average error)."
+            )
+        else:
+            st.caption(
+                f"Surface-data model with the latest operating conditions held constant. The band (± {last['band']:.1f} {unit}) "
+                "applies when conditions resemble the training data."
+            )
+        add_page_context(
+            "Prediction analysis",
+            f"{spec['label']} outlook from {anchor_value:,.1f} {unit} at {forecast.get('starts_after')}: "
+            + "; ".join(f"+{h['minutes']} min {h['predicted']:,.1f} ± {h['band']:.1f} {unit} ({h['method']})" for h in horizons),
+        )
+        warnings = forecast.get("out_of_range_now") or forecast.get("out_of_range_end") or []
+        if warnings or future_df.get("extrapolated", pd.Series(dtype=bool)).any():
+            st.warning(
+                "Some inputs are outside the range the model was trained on, so this projection is less reliable: "
+                + "; ".join(warnings),
+                icon=":material/warning:",
+            )
+
+
+def render_model_performance(target_key, target_data, row_count):
+    spec = PREDICTION_TARGETS[target_key]
+    unit = spec["unit"]
+    evaluation = target_data.get("evaluation") or {}
+    best = target_data.get("best_model", "Unavailable")
+    best_metrics = (target_data.get("metrics") or {}).get(best, {})
+    injecting_metrics = evaluation.get("best_model_injecting_metrics") or {}
+    interval = evaluation.get("interval") or {}
+    add_page_context(
+        "Prediction analysis",
+        f"{spec['label']}: selected model {best}; trained on {row_count:,} PostgreSQL fulldata rows",
+    )
+
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.markdown(f"Selected model: **{best}**")
+        st.badge("Chosen on unseen periods", color="green", icon=":material/verified:", help=evaluation.get("selection"))
+
+    with st.container(horizontal=True):
+        if best_metrics:
+            show_metric(st, "Accuracy on unseen data (R²)", f"{best_metrics['r2']:.3f}", border=True,
+                        help="Score on the most recent 20% of readings, which the model never saw. "
+                             "R² can be low when the reading barely changes in that window; check the average error too.")
+        if injecting_metrics:
+            show_metric(st, "Average error while injecting", f"{injecting_metrics['mae']:.2f} {unit}", border=True,
+                        help="Average absolute error on injecting readings in the unseen recent data.")
+        if interval.get("recent_conditions") is not None:
+            show_metric(st, "Error band, familiar conditions", f"± {interval['recent_conditions']:.1f} {unit}", border=True,
+                        help="90% of errors on the unseen recent data fell inside this band.")
+        if interval.get("new_period") is not None:
+            show_metric(st, "Error band, new operating period", f"± {interval['new_period']:.1f} {unit}", border=True,
+                        help="90% of errors when predicting a whole recording period the model never saw.")
+    if evaluation:
+        st.caption(
+            f"{evaluation['description']} Test window {pd.to_datetime(evaluation['test_start']):%d %b %H:%M} to "
+            f"{pd.to_datetime(evaluation['test_end']):%d %b %H:%M} ({evaluation['test_rows']:,} readings)."
+        )
+
+    test_df = pd.DataFrame(target_data.get("test_predictions", []))
+    if test_df.empty:
+        st.warning("No test predictions were returned for this target.")
+        return
+    test_df["timestamp"] = pd.to_datetime(test_df["timestamp"])
+
+    over_time = go.Figure()
+    over_time.add_trace(go.Scattergl(x=test_df["timestamp"], y=test_df["actual"], mode="lines", name="Measured",
+                                     line=dict(color=BRAND_GREY, width=1.6)))
+    over_time.add_trace(go.Scattergl(x=test_df["timestamp"], y=test_df["predicted"], mode="lines", name="Predicted",
+                                     line=dict(color=BRAND_GREEN, width=1.6)))
+    over_time.update_layout(title_text=f"Measured vs predicted on unseen data ({unit})")
+    show_chart(style_prediction_figure(over_time, height=320))
+
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        low = float(min(test_df["actual"].min(), test_df["predicted"].min()))
+        high = float(max(test_df["actual"].max(), test_df["predicted"].max()))
+        scatter = go.Figure()
+        scatter.add_trace(go.Scatter(x=[low, high], y=[low, high], mode="lines", name="Perfect prediction",
+                                     line=dict(color=BRAND_GREY, dash="dash", width=1), hoverinfo="skip"))
+        scatter.add_trace(go.Scattergl(
+            x=test_df["actual"], y=test_df["predicted"], mode="markers", name="Readings",
+            marker=dict(color=BRAND_GREEN, size=5, opacity=0.35),
+            hovertemplate=f"Measured %{{x:,.1f}} {unit}<br>Predicted %{{y:,.1f}} {unit}<extra></extra>",
+        ))
+        scatter.update_layout(title_text="Predicted vs measured", xaxis_title=f"Measured ({unit})", yaxis_title=f"Predicted ({unit})")
+        style_prediction_figure(scatter, height=320, unified_hover=False)
+        scatter.update_xaxes(title_text=f"Measured ({unit})")
+        show_chart(scatter)
+    with chart_col2:
+        residuals = go.Figure(go.Histogram(x=test_df["residual"], nbinsx=50, marker_color=BRAND_GREEN, name="Readings",
+                                           hovertemplate=f"Error %{{x:,.1f}} {unit}: %{{y}} readings<extra></extra>"))
+        residuals.add_vline(x=0, line_color=BRAND_GREY, line_dash="dash", line_width=1)
+        residuals.update_layout(title_text="Prediction errors (measured − predicted)", yaxis_title="Readings", showlegend=False)
+        style_prediction_figure(residuals, height=320, unified_hover=False)
+        residuals.update_xaxes(title_text=f"Error ({unit})")
+        show_chart(residuals)
+
+    importance_df = pd.DataFrame(target_data.get("feature_importance", []))
+    if not importance_df.empty:
+        top = importance_df.sort_values("importance", ascending=False).head(10).iloc[::-1].copy()
+        top["label"] = top["feature"].map(friendly_feature)
+        importance_fig = go.Figure(go.Bar(
+            x=top["importance"], y=top["label"], orientation="h", marker_color=BRAND_GREEN,
+            hovertemplate="%{y}: %{x:.3f}<extra></extra>",
+        ))
+        importance_fig.update_layout(title_text="What the model relies on most (top 10 inputs)", showlegend=False)
+        style_prediction_figure(importance_fig, height=360, unified_hover=False)
+        importance_fig.update_xaxes(title_text="Importance")
+        show_chart(importance_fig)
+
+    with st.expander("Model comparison and validation details", icon=":material/table_chart:"):
+        metrics_df = pd.DataFrame(target_data.get("metrics", {})).T.drop(columns=["mse"], errors="ignore")
+        if not metrics_df.empty:
+            metrics_df.index.name = "Model"
+            metrics_df = metrics_df.rename(columns={
+                "holdout_mae": f"Error on held-out periods ({unit})",
+                "mae": f"Average error, recent 20% ({unit})",
+                "rmse": f"RMSE, recent 20% ({unit})",
+                "r2": "R², recent 20%",
+            })
+            st.markdown("**Candidate models**")
+            show_table(metrics_df, f"{spec['label']} model metrics",
+                       column_config={column: st.column_config.NumberColumn(format="%.2f") for column in metrics_df.columns})
+            if evaluation.get("selection"):
+                st.caption(evaluation["selection"])
+        period_holdout = evaluation.get("period_holdout") or []
+        if period_holdout:
+            holdout_df = pd.DataFrame(period_holdout).rename(columns={
+                "period": "Held-out recording period", "rows": "Injecting readings",
+                "mae": f"Model error ({unit})", "rmse": f"Model RMSE ({unit})",
+                "baseline_mae": f"Predict-the-average error ({unit})",
+            })
+            st.markdown("**Harder test: predicting a whole recording period the model never saw**")
+            show_table(holdout_df, f"{spec['label']} held-out period test", hide_index=True,
+                       column_config={column: st.column_config.NumberColumn(format="%.2f")
+                                      for column in holdout_df.columns if "error" in column or "RMSE" in column})
+        if evaluation.get("random_split_metrics"):
+            st.caption(
+                f"For comparison, the earlier random-split test scored R² {evaluation['random_split_metrics']['r2']:.3f}. "
+                "That score is over-optimistic because neighbouring 5-second readings land in both training and test sets."
+            )
+    with st.expander("Test predictions (data)", icon=":material/dataset:"):
+        show_table(test_df, f"{spec['label']} test predictions", hide_index=True)
 
 
 EVENT_CATALOG = {
@@ -1595,7 +2157,8 @@ st.session_state["page"] = page
 if callable(set_qs):
     set_qs(page=page)
 
-simulated_time = get_monitoring_timestamp() if page in {"Overview", "Prediction"} else None
+SIMULATED_TIME_PAGES = {"Overview", "Prediction", "Injection Optimization Simulator"}
+simulated_time = get_monitoring_timestamp() if page in SIMULATED_TIME_PAGES else None
 reset_page_context(
     page,
     f"Page: {page}. Data source: data/excel/combined_co2_data_only_file.xls and PostgreSQL fulldata."
@@ -1702,217 +2265,134 @@ if page == "Overview":
             show_chart(fig)
 
 elif page == "Prediction":
-    st.header("Bottom-Hole Conditions")
+    st.header("Bottom-hole prediction", anchor=False)
+    st.caption(
+        "Live bottom-hole conditions, what the models expect over the next hour, and how far each model can be trusted."
+    )
+
+    # 1. Current conditions at the simulated time.
+    st.subheader("Current conditions", anchor=False)
     prediction_start, prediction_end = get_excel_date_range(end_timestamp=simulated_time)
+    prediction_df = pd.DataFrame()
     if prediction_start and prediction_end:
-        with st.spinner("Loading fulldata charts..."):
+        with st.spinner("Loading bottom-hole readings..."):
             prediction_response = api_get(
                 "/api/dashboard/metrics",
-                params={
-                    "start": f"{prediction_start}T00:00:00",
-                    "end": query_end_timestamp(prediction_end),
-                },
+                params={"start": f"{prediction_start}T00:00:00", "end": query_end_timestamp(prediction_end)},
                 timeout=30,
             )
-
         prediction_df = pd.DataFrame((prediction_response or {}).get("timeseries", []))
-        if not prediction_df.empty:
-            prediction_df["date_time"] = pd.to_datetime(prediction_df["timestamp"])
-
-            # Show the latest predicted parameters using the same status cards as Overview.
-            prediction_df = prediction_df.sort_values("date_time")
-            pressure_values = pd.to_numeric(
-                prediction_df["corrected_bottom_hole_pressure"], errors="coerce"
-            ).dropna()
-            temperature_values = pd.to_numeric(prediction_df["bht"], errors="coerce").dropna()
-            if not pressure_values.empty and not temperature_values.empty:
-                latest_pressure = float(pressure_values.iloc[-1])
-                latest_temperature = float(temperature_values.iloc[-1])
-                pressure_previous = pressure_values.iloc[max(0, len(pressure_values) - 11):-1]
-                temperature_previous = temperature_values.iloc[max(0, len(temperature_values) - 11):-1]
-                pressure_average = pressure_previous.mean()
-                temperature_average = temperature_previous.mean()
-                pressure_trend = ((latest_pressure - pressure_average) / pressure_average * 100) if pressure_average else 0
-                temperature_trend = ((latest_temperature - temperature_average) / temperature_average * 100) if temperature_average else 0
-
-                st.subheader("Current Status")
-                status_col1, status_col2 = st.columns(2)
-                with status_col1:
-                    metric_card(
-                        label="Corrected Bottom-Hole Pressure",
-                        value=latest_pressure,
-                        unit="PSI",
-                        color="#0078D4",
-                        icon="📊",
-                        trend=pressure_trend,
-                        min_val=float(pressure_values.min()),
-                        max_val=float(pressure_values.max()),
-                    )
-                with status_col2:
-                    metric_card(
-                        label="Bottom-Hole Temperature",
-                        value=latest_temperature,
-                        unit="°F",
-                        color="#FF6B6B",
-                        icon="🌡️",
-                        trend=temperature_trend,
-                        min_val=float(temperature_values.min()),
-                        max_val=float(temperature_values.max()),
-                    )
-
-            chart_col1, chart_col2 = st.columns(2)
-
-            with chart_col1:
-                corrected_pressure_fig = px.line(
-                    prediction_df,
-                    x="date_time",
-                    y="corrected_bottom_hole_pressure",
-                    title="Corrected Bottom-Hole Pressure (fulldata)",
-                    labels={
-                        "date_time": "Date and time",
-                        "corrected_bottom_hole_pressure": "Corrected pressure",
-                    },
+    if prediction_df.empty:
+        st.info("No bottom-hole readings are available for this period.", icon=":material/info:")
+    else:
+        prediction_df["date_time"] = pd.to_datetime(prediction_df["timestamp"])
+        prediction_df = prediction_df.sort_values("date_time")
+        flow = pd.to_numeric(prediction_df.get("flow_bpm"), errors="coerce").dropna()
+        injecting_now = bool(not flow.empty and flow.iloc[-1] > 1.0)
+        status_cols = st.columns(2)
+        for column, target_key in zip(status_cols, PREDICTION_TARGETS):
+            spec = PREDICTION_TARGETS[target_key]
+            prediction_df[spec["column"]] = pd.to_numeric(prediction_df[spec["column"]], errors="coerce")
+            values = prediction_df[["date_time", spec["column"]]].dropna()
+            with column, st.container(border=True):
+                if values.empty:
+                    st.markdown(f"**{spec['label']}**")
+                    st.caption("No readings yet.")
+                    continue
+                latest = float(values[spec["column"]].iloc[-1])
+                previous = float(values[spec["column"]].iloc[max(0, len(values) - 11)])
+                status, colour, icon = condition_status(spec, latest, injecting_now)
+                low, high = spec["normal"]
+                with st.container(horizontal=True, vertical_alignment="center"):
+                    st.markdown(f"**{spec['label']}**")
+                    st.space("stretch")
+                    st.badge(status, color=colour, icon=icon)
+                show_metric(
+                    st,
+                    f"Latest {spec['short']} · {values['date_time'].iloc[-1]:%d %b %H:%M}",
+                    f"{latest:,.1f} {spec['unit']}",
+                    delta=f"{latest - previous:+,.1f} {spec['unit']} over the last 10 readings",
+                    delta_color="off",
+                    help=f"Normal {low:,.0f}–{high:,.0f} {spec['unit']}; critical above {spec['critical']:,.0f} {spec['unit']}.",
                 )
-                show_chart(corrected_pressure_fig)
-
-            with chart_col2:
-                bottom_temperature_fig = px.line(
-                    prediction_df,
-                    x="date_time",
-                    y="bht",
-                    title="Bottom-Hole Temperature (fulldata)",
-                    labels={"date_time": "Date and time", "bht": "Temperature"},
+                add_page_context(
+                    "Current conditions",
+                    f"{spec['label']}: {latest:,.1f} {spec['unit']} ({status}); normal {low:,.0f}-{high:,.0f} {spec['unit']}",
                 )
-                show_chart(bottom_temperature_fig)
+                show_chart(bottom_hole_trend_chart(values, spec))
+
+    # 2. Next-hour outlook and 3. model performance, from the trained models.
+    if "prediction_analysis" not in st.session_state:
+        with st.spinner("Loading the prediction models..."):
+            analysis_response = api_get("/api/prediction", timeout=120)
+        if analysis_response is not None:
+            st.session_state["prediction_analysis"] = analysis_response
+    prediction_analysis = st.session_state.get("prediction_analysis")
+    if not prediction_analysis:
+        st.warning("The prediction models are not available. Check that the FastAPI backend is running.", icon=":material/warning:")
+    else:
+        st.subheader("Next-hour outlook", anchor=False)
+        outlook = api_get(
+            "/api/prediction/outlook",
+            params={"at": simulated_time.isoformat()} if simulated_time is not None else None,
+            timeout=120,
+        )
+        if not outlook:
+            st.info("The next-hour outlook is not available for the simulated time yet.", icon=":material/info:")
         else:
-            st.info("No fulldata records are available for this period.")
+            anchor_time = pd.to_datetime(outlook["anchor_time"])
+            st.caption(
+                f"Starts from the reading at {anchor_time:%d %b %Y, %H:%M:%S}, the latest one at the simulated time, "
+                "and moves forward with the simulated clock. Shaded bands hold 90% of the errors measured on unseen data."
+            )
+            if outlook.get("minutes_since_reading", 0) > 10:
+                hours = outlook["minutes_since_reading"] / 60
+                st.warning(
+                    f"The surface instruments were not recording at the simulated time. This outlook starts from the "
+                    f"last recording, {hours:,.1f} hours earlier, so treat it as out of date.",
+                    icon=":material/schedule:",
+                )
+            outlook_cols = st.columns(2)
+            for column, target_key in zip(outlook_cols, PREDICTION_TARGETS):
+                spec = PREDICTION_TARGETS[target_key]
+                history = pd.DataFrame(columns=["timestamp", "actual"])
+                if not prediction_df.empty and spec["column"] in prediction_df:
+                    history = (
+                        prediction_df[["date_time", spec["column"]]].dropna()
+                        .rename(columns={"date_time": "timestamp", spec["column"]: "actual"})
+                    )
+                    history = history[history["timestamp"] <= anchor_time]
+                with column:
+                    render_prediction_outlook(target_key, outlook.get(target_key, {}), history)
 
-    st.header("Notebook Prediction Analysis")
-    prediction_action_col, prediction_status_col = st.columns([1, 2])
-    with prediction_action_col:
-        if "prediction_analysis" not in st.session_state:
-            with st.spinner("Training pressure and temperature models..."):
-                analysis_response = api_get("/api/prediction", timeout=120)
-            if analysis_response is not None:
-                st.session_state["prediction_analysis"] = analysis_response
-        if st.button("Import Full Data to PostgreSQL"):
+        st.subheader("Model performance", anchor=False)
+        st.caption(
+            f"How accurate each model is on data it never saw during training. Trained on "
+            f"{prediction_analysis.get('row_count', 0):,} readings from three recording periods."
+        )
+        performance_tabs = st.tabs([PREDICTION_TARGETS[key]["label"] for key in PREDICTION_TARGETS], key="prediction_tabs")
+        for tab, target_key in zip(performance_tabs, PREDICTION_TARGETS):
+            with tab:
+                render_model_performance(target_key, prediction_analysis.get(target_key, {}), prediction_analysis.get("row_count", 0))
+
+    with st.expander("Data management", icon=":material/database:"):
+        st.caption("Re-import the Full sheet of the Excel workbook into the PostgreSQL fulldata table.")
+        if st.button("Import full data to PostgreSQL", icon=":material/upload:", key="prediction_import"):
             with st.spinner("Importing the Full sheet into fulldata..."):
                 ingest_response = api_post("/api/ingest-fulldata", timeout=120)
             if ingest_response is not None:
-                st.success(f"Imported {ingest_response.get('inserted', 0):,} rows")
-    with prediction_status_col:
-        prediction_analysis = st.session_state.get("prediction_analysis")
-        if prediction_analysis:
-            st.caption(
-                f"Trained on {prediction_analysis.get('row_count', 0):,} active recording rows "
-                "from PostgreSQL fulldata."
-            )
-
-    prediction_analysis = st.session_state.get("prediction_analysis")
-    if prediction_analysis:
-        for target_key, target_data in (
-            ("pressure", prediction_analysis.get("pressure", {})),
-            ("temperature", prediction_analysis.get("temperature", {})),
-        ):
-            st.subheader(target_data.get("label", target_key.title()))
-            st.write(f"Selected model: **{target_data.get('best_model', 'Unavailable')}**")
-            add_page_context(
-                "Prediction analysis",
-                f"{target_data.get('label', target_key)}: selected (best) model is "
-                f"{target_data.get('best_model', 'Unavailable')}; trained on "
-                f"{prediction_analysis.get('row_count', 0):,} PostgreSQL fulldata rows",
-            )
-            metrics_df = pd.DataFrame(target_data.get("metrics", {})).T
-            if not metrics_df.empty:
-                metrics_df.index.name = "Model"
-                show_table(metrics_df, f"{target_data.get('label', target_key)} model metrics")
-
-            test_df = pd.DataFrame(target_data.get("test_predictions", []))
-            future_df = pd.DataFrame(target_data.get("future_predictions", []))
-            importance_df = pd.DataFrame(target_data.get("feature_importance", []))
-            if test_df.empty:
-                st.warning("No test predictions were returned for this target.")
-                continue
-
-            test_df["timestamp"] = pd.to_datetime(test_df["timestamp"])
-            with st.expander("Prediction results table"):
-                show_table(test_df, f"{target_data.get('label', target_key)} test predictions")
-            chart_col1, chart_col2 = st.columns(2)
-            with chart_col1:
-                actual_predicted_fig = px.scatter(
-                    test_df,
-                    x="actual",
-                    y="predicted",
-                    title=f"{target_data.get('label')}: Actual vs Predicted",
-                    labels={"actual": "Actual", "predicted": "Predicted"},
-                )
-                show_chart(actual_predicted_fig)
-            with chart_col2:
-                residual_fig = px.histogram(
-                    test_df,
-                    x="residual",
-                    nbins=50,
-                    title=f"{target_data.get('label')}: Residual Distribution",
-                    labels={"residual": "Residual (actual - predicted)"},
-                )
-                show_chart(residual_fig)
-
-            time_fig = px.line(
-                test_df,
-                x="timestamp",
-                y=["actual", "predicted"],
-                title=f"{target_data.get('label')}: Actual vs Predicted Over Time",
-                labels={"value": target_data.get("label"), "timestamp": "Date and time"},
-            )
-            if target_key == "pressure" and not future_df.empty:
-                future_df["timestamp"] = pd.to_datetime(future_df["timestamp"])
-                future_fig = px.line(
-                    future_df,
-                    x="timestamp",
-                    y="predicted",
-                    labels={
-                        "predicted": target_data.get("label"),
-                        "timestamp": "Date and time",
-                    },
-                )
-                future_trace = future_fig.data[0]
-                future_trace.name = "Future forecast"
-                future_trace.line = {"dash": "dash", "color": "#FF7F0E", "width": 3}
-                time_fig.add_trace(future_trace)
-                time_fig.add_vline(
-                    x=test_df["timestamp"].max(),
-                    line_dash="dot",
-                    line_color="#888888",
-                    annotation_text="Forecast starts",
-                    annotation_position="top left",
-                )
-                st.caption(
-                    "Future forecast uses the selected model with the latest operating "
-                    "conditions held constant for the next 24 recording intervals."
-                )
-            show_chart(time_fig)
-
-            if not importance_df.empty:
-                importance_fig = px.bar(
-                    importance_df.sort_values("importance"),
-                    x="importance",
-                    y="feature",
-                    orientation="h",
-                    title=f"Feature Importance: {target_data.get('label')}",
-                    labels={"importance": "Importance", "feature": "Feature"},
-                )
-                show_chart(importance_fig)
+                st.success(f"Imported {ingest_response.get('inserted', 0):,} rows", icon=":material/check_circle:")
 
 elif page == "Injection Optimization Simulator":
     st.header("Injection Optimization Simulator")
     st.write("Use the trained CBHP and BHT models to test operating limits before injection.")
 
-    default_conditions_response = api_get("/api/injection-optimization/defaults", timeout=30)
+    default_conditions_response = api_get(
+        "/api/injection-optimization/defaults",
+        params={"at": simulated_time.isoformat()} if simulated_time is not None else None,
+        timeout=30,
+    )
     default_conditions = (default_conditions_response or {}).get("conditions") or {}
-    if default_conditions:
-        st.caption(f"Operating-condition defaults loaded from database row: {default_conditions.get('timestamp', 'latest')}")
-    else:
-        st.warning("No database row contains nonzero values for all operating-condition inputs. Using zero defaults.")
 
     mode_labels = {
         "Maximum Injection": "maximum_injection",
@@ -1921,21 +2401,92 @@ elif page == "Injection Optimization Simulator":
     }
     selected_mode = st.segmented_control("Optimization mode", list(mode_labels), default="Maximum Injection")
     mode = mode_labels[selected_mode]
+    if mode == "temperature_control":
+        st.warning(
+            "BHT responds to flow changes slowly, and in tests on real flow changes these BHT predictions were less "
+            "accurate than assuming BHT stays the same. Treat this mode as indicative only, and use the live BHT "
+            "forecast on the **Prediction** page for operating decisions.",
+            icon=":material/thermostat:",
+        )
 
+    # Operating conditions follow the reading at the simulated time (like the Overview and Prediction pages)
+    # unless the user switches "Follow simulated time" off to test a what-if scenario.
+    condition_keys = {
+        "surface_psi": "optimizer_surface_psi",
+        "annulus_psi": "optimizer_annulus_psi",
+        "pump_speed": "optimizer_pump_speed",
+        "surface_temp": "optimizer_surface_temp",
+        "temperature_before_triplex": "optimizer_triplex_temp",
+        "pressure_before_triplex": "optimizer_triplex_pressure",
+        "flow_bpm": "optimizer_current_flow",
+    }
     with st.container(border=True):
-        st.subheader("Operating conditions")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.subheader("Operating conditions", anchor=False)
+            st.space("stretch")
+            follow_live = st.toggle(
+                "Follow simulated time",
+                value=True,
+                key="optimizer_follow_live",
+                help="On: the conditions update to the reading at the dashboard's simulated time every minute. "
+                     "Off: edit them freely to test a what-if scenario.",
+            )
+        for field, key in condition_keys.items():
+            # Set the widget values through Session State before the widgets are drawn: synced every run while
+            # following, initialised once otherwise so the user's own edits are kept.
+            if follow_live and default_conditions:
+                st.session_state[key] = float(default_conditions.get(field) or 0.0)
+            else:
+                st.session_state.setdefault(key, float(default_conditions.get(field) or 0.0))
+        if not default_conditions:
+            st.warning("No complete operating-condition reading exists at or before the simulated time.", icon=":material/warning:")
+        elif follow_live:
+            reading_time = pd.to_datetime(default_conditions["timestamp"])
+            flow_now = default_conditions.get("flow_bpm")
+            st.caption(
+                f"Live: reading at {reading_time:%d %b %Y, %H:%M:%S}, the latest at the simulated time"
+                + (f" (current flow {flow_now:.2f} BPM)" if flow_now is not None else "")
+                + ". Switch off **Follow simulated time** to edit the values."
+            )
+            if simulated_time is not None and simulated_time - reading_time > pd.Timedelta(minutes=10):
+                st.warning(
+                    f"The surface instruments were not recording at the simulated time; these are the last recorded "
+                    f"conditions, {(simulated_time - reading_time).total_seconds() / 3600:,.1f} hours earlier.",
+                    icon=":material/schedule:",
+                )
+        else:
+            st.caption("What-if mode: the values below are yours to edit and no longer follow the simulated time.")
         input_col1, input_col2, input_col3 = st.columns(3)
         with input_col1:
-            surface_psi = st.number_input("Surface PSI", value=float(default_conditions.get("surface_psi", 0.0)), key="optimizer_surface_psi")
-            annulus_psi = st.number_input("Annulus PSI", value=float(default_conditions.get("annulus_psi", 0.0)), key="optimizer_annulus_psi")
-            pump_speed = st.number_input("Pump speed", value=float(default_conditions.get("pump_speed", 0.0)), key="optimizer_pump_speed")
+            surface_psi = st.number_input("Surface PSI", key="optimizer_surface_psi", disabled=follow_live)
+            annulus_psi = st.number_input("Annulus PSI", key="optimizer_annulus_psi", disabled=follow_live)
+            pump_speed = st.number_input(
+                "Pump speed",
+                key="optimizer_pump_speed",
+                disabled=follow_live,
+                help="For reference only: during the search, pump speed is set from each flow rate because the two move together.",
+            )
         with input_col2:
-            surface_temp = st.number_input("Surface temperature", value=float(default_conditions.get("surface_temp", 0.0)), key="optimizer_surface_temp")
-            temperature_before_triplex = st.number_input("Temperature before Triplex", value=float(default_conditions.get("temperature_before_triplex", 0.0)), key="optimizer_triplex_temp")
+            surface_temp = st.number_input("Surface temperature", key="optimizer_surface_temp", disabled=follow_live)
+            temperature_before_triplex = st.number_input("Temperature before Triplex", key="optimizer_triplex_temp", disabled=follow_live)
+            current_flow = st.number_input(
+                "Current flow rate (BPM)",
+                min_value=0.0,
+                key="optimizer_current_flow",
+                disabled=follow_live,
+                help="The flow at which the conditions above were measured. Surface pressure, surface temperature and "
+                     "the pump-inlet readings are moved from this point as each flow rate is tested.",
+            )
         with input_col3:
-            pressure_before_triplex = st.number_input("Pressure before Triplex", value=float(default_conditions.get("pressure_before_triplex", 0.0)), key="optimizer_triplex_pressure")
+            pressure_before_triplex = st.number_input("Pressure before Triplex", key="optimizer_triplex_pressure", disabled=follow_live)
             flow_min = st.number_input("Search flow minimum (BPM)", min_value=0.0, value=0.0, key="optimizer_flow_min")
-            flow_max = st.number_input("Search flow maximum (BPM)", min_value=0.01, value=100.0, key="optimizer_flow_max")
+            flow_max = st.number_input(
+                "Search flow maximum (BPM)",
+                min_value=0.01,
+                value=5.0,
+                key="optimizer_flow_max",
+                help="The search is capped at the highest flow in the data (5.0 BPM); the models cannot predict reliably beyond it.",
+            )
             flow_step = st.number_input("Search step (BPM)", min_value=0.01, value=1.0, key="optimizer_flow_step")
 
     with st.container(border=True):
@@ -1958,13 +2509,16 @@ elif page == "Injection Optimization Simulator":
             else:
                 limit = st.number_input("Maximum allowable BHT (°F)", value=125.0, key="optimizer_bht_limit")
         with action_col:
-            st.caption("The optimizer evaluates the selected flow range using the existing Prediction models.")
+            st.caption(
+                "The optimizer evaluates the selected flow range and only accepts a flow rate when the predicted "
+                "value plus its 90% error margin stays within the limit."
+            )
             run_optimizer = st.button("Run optimization", type="primary", key="optimizer_run")
     add_page_context(
         "Simulator inputs",
         f"Mode: {selected_mode}; surface PSI {surface_psi}; annulus PSI {annulus_psi}; pump speed {pump_speed}; "
         f"surface temperature {surface_temp} °F; temperature before triplex {temperature_before_triplex} °F; "
-        f"pressure before triplex {pressure_before_triplex}; flow search {flow_min}-{flow_max} BPM step {flow_step}; "
+        f"pressure before triplex {pressure_before_triplex}; current flow {current_flow} BPM; flow search {flow_min}-{flow_max} BPM step {flow_step}; "
         + (
             f"maximum allowable BHT {limit} °F"
             if mode == "temperature_control"
@@ -1986,6 +2540,7 @@ elif page == "Injection Optimization Simulator":
                     "surface_temp": surface_temp,
                     "temperature_before_triplex": temperature_before_triplex,
                     "pressure_before_triplex": pressure_before_triplex,
+                    "flow_bpm": current_flow,
                 },
                 "flow_min": flow_min,
                 "flow_max": flow_max,
@@ -2001,9 +2556,19 @@ elif page == "Injection Optimization Simulator":
                 optimizer_response = api_post("/api/injection-optimization", json=payload, timeout=120)
             if optimizer_response is not None:
                 st.session_state["optimizer_response"] = optimizer_response
+                st.session_state["optimizer_conditions_note"] = (
+                    f"conditions at {pd.to_datetime(default_conditions['timestamp']):%d %b %Y, %H:%M:%S} (simulated time)"
+                    if follow_live and default_conditions
+                    else "your what-if conditions"
+                )
 
     result = st.session_state.get("optimizer_response")
     if result and result.get("mode") == mode:
+        if st.session_state.get("optimizer_conditions_note"):
+            st.caption(
+                f"Result calculated for {st.session_state['optimizer_conditions_note']}. "
+                "Click **Run optimization** again to use the latest conditions."
+            )
         if mode == "temperature_control" and not result.get("feasible", True):
             closest = result["closest_result"]
             st.warning(
@@ -2012,21 +2577,28 @@ elif page == "Injection Optimization Simulator":
             )
             result_col1, result_col2 = st.columns(2)
             show_metric(result_col1, "Closest flow", f"{closest['flow_bpm']:.2f} BPM")
-            show_metric(result_col2, "Closest predicted BHT", f"{closest['predicted_bht']:.2f} °F")
+            show_metric(result_col2, "Closest predicted BHT", f"{closest['predicted_bht']:.2f} ± {result.get('bht_margin', 0):.1f} °F")
         elif mode == "maximum_injection":
             result_col1, result_col2, result_col3 = st.columns(3)
             show_metric(result_col1, "Recommended flow", f"{result['recommended_flow_bpm']:.2f} BPM")
-            show_metric(result_col2, "Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
-            show_metric(result_col3, "Predicted BHT", f"{result['predicted_bht']:.2f} °F")
+            show_metric(result_col2, "Predicted CBHP", f"{result['predicted_cbhp']:.1f} ± {result.get('cbhp_margin', 0):.1f} psi")
+            show_metric(result_col3, "Predicted BHT (indicative)", f"{result['predicted_bht']:.1f} ± {result.get('bht_margin', 0):.1f} °F",
+                        help=result.get("bht_reliability"))
+            if result.get("results"):
+                show_chart(optimizer_flow_chart(result))
         elif mode == "safe_operation":
             result_col1, result_col2, result_col3 = st.columns(3)
             show_metric(result_col1, "Maximum safe flow", f"{result['recommended_flow_bpm']:.2f} BPM")
-            show_metric(result_col2, "Predicted CBHP", f"{result['predicted_cbhp']:.2f} psi")
-            show_metric(result_col3, "Remaining pressure margin", f"{result['remaining_pressure_margin']:.2f} psi")
+            show_metric(result_col2, "Predicted CBHP", f"{result['predicted_cbhp']:.1f} ± {result.get('cbhp_margin', 0):.1f} psi")
+            show_metric(result_col3, "Remaining pressure margin", f"{result['remaining_pressure_margin']:.2f} psi",
+                        help="Safe operating limit minus the upper end of the predicted CBHP (prediction + 90% error margin).")
             st.caption(
                 f"Safe operating limit: {result['safe_operating_limit']:.2f} psi "
-                f"({result['safety_margin_pct']:.2f}% below the {result['maximum_allowable_cbhp']:.2f} psi maximum)."
+                f"({result['safety_margin_pct']:.2f}% below the {result['maximum_allowable_cbhp']:.2f} psi maximum). "
+                f"Predicted BHT (indicative): {result['predicted_bht']:.1f} °F."
             )
+            if result.get("results"):
+                show_chart(optimizer_flow_chart(result))
         else:
             acceptable_df = pd.DataFrame(result["acceptable_results"])
             result_col1, result_col2, result_col3 = st.columns(3)
@@ -2043,7 +2615,20 @@ elif page == "Injection Optimization Simulator":
             )
             show_chart(chart)
             show_table(acceptable_df, "Acceptable operating conditions", hide_index=True)
-        st.caption(f"CBHP model: {result['models']['cbhp']} | BHT model: {result['models']['bht']}")
+        st.caption(f"CBHP model: {result['models']['cbhp']} | BHT model (indicative): {result['models']['bht']}")
+        if result.get("cbhp_method"):
+            st.caption(f"How CBHP responds to flow: {result['cbhp_method']}")
+        if result.get("decision_rule"):
+            st.caption(
+                f"{result['decision_rule']} Error margins (90% of errors on unseen data): CBHP ± {result['cbhp_margin']:.1f} psi, "
+                f"BHT ± {result['bht_margin']:.1f} °F."
+            )
+        if result.get("flow_search_capped"):
+            st.info(
+                f"The flow search was capped at {result['flow_cap_bpm']:.2f} BPM, the highest flow in the training data. "
+                "Predictions above it would be extrapolation.",
+                icon=":material/info:",
+            )
         add_page_context(
             "Optimization result",
             json.dumps({key: value for key, value in result.items() if key not in {"acceptable_results", "results"}}, default=str),
@@ -2312,24 +2897,36 @@ elif page == "AI Chatbot":
         st.session_state[history_key] = []
 
     selected_segy_path = None
+    segy_all_files = False
     if source_key == "postgresql":
         st.caption("The chatbot searches the full PostgreSQL table automatically. Include a date or time phrase in your question when you need a specific period.")
     else:
         file_index = build_segy_file_index(Path("data/segy"))
         available_files = sorted(file_index.items(), key=lambda item: (item[0][0], item[0][1]))
         file_labels = [f"Event {event_id} - {well} - {path.name}" for (event_id, well), path in available_files]
-        selected_label = st.selectbox("Select a SEGY file", file_labels) if file_labels else None
-        if selected_label:
+        all_files_label = f"All SEGY files ({len(file_labels)} files)"
+        selected_label = (
+            st.selectbox("Select a SEGY file", [all_files_label, *file_labels], key="chat_segy_file")
+            if file_labels else None
+        )
+        segy_all_files = selected_label == all_files_label
+        if selected_label and not segy_all_files:
             selected_segy_path = available_files[file_labels.index(selected_label)][1]
         uploaded_segy = st.file_uploader("Or upload one SEGY file", type=["sgy", "segy"], key="chat_segy_upload")
         if uploaded_segy is not None:
             with tempfile.NamedTemporaryFile(suffix=Path(uploaded_segy.name).suffix, delete=False) as temp_file:
                 temp_file.write(uploaded_segy.getbuffer())
                 selected_segy_path = Path(temp_file.name)
+            segy_all_files = False
             st.caption(f"Currently selected source file: {uploaded_segy.name}")
+        elif segy_all_files:
+            st.caption(
+                "Currently selected source: all SEGY files. Questions compare event detection across every file "
+                "(the first question scans all files once, about 40 seconds)."
+            )
         elif selected_segy_path is not None:
             st.caption(f"Currently selected source file: {selected_segy_path.name}")
-        if selected_segy_path is None:
+        if selected_segy_path is None and not segy_all_files:
             st.warning("Select or upload a SEGY file before asking questions.")
 
     suggested_prompts = (
@@ -2342,6 +2939,13 @@ elif page == "AI Chatbot":
             "Is the latest corrected bottom hole pressure safe?",
         ]
         if source_key == "postgresql"
+        else [
+            "Based on all SEGY files, which files have an event?",
+            "Which well recorded each event most clearly?",
+            "Which events were not clearly detected, and why?",
+            "Compare arrival times of event 6 across wells.",
+        ]
+        if segy_all_files
         else [
             "Show metadata for this SEGY file.",
             "How many traces and samples does it contain?",
@@ -2394,6 +2998,7 @@ elif page == "AI Chatbot":
                 prompt,
                 selected_segy_path,
                 history=st.session_state[history_key],
+                all_files=segy_all_files,
             )
         st.session_state[history_key].append({"role": "assistant", "content": answer, "source": answer_source, "chart": chart, "answered_by": answered_by})
         with st.chat_message("assistant"):

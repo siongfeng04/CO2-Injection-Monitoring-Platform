@@ -111,11 +111,14 @@ def full_data_rows(db: Session) -> list[dict[str, Any]]:
     ]
 
 
-def latest_operating_conditions(db: Session) -> dict[str, Any] | None:
+def latest_operating_conditions(db: Session, at: datetime | None = None) -> dict[str, Any] | None:
+    """Latest reading with all optimizer inputs recorded, at or before ``at`` (the dashboard's simulated time).
+
+    Pump speed is not required: it was not logged on 20 Sep 2009, and the optimizer sets it from the flow rate.
+    """
     required_fields = [
         models.FullData.surface_psi,
         models.FullData.annulus_psi,
-        models.FullData.pump_speed,
         models.FullData.surface_temp,
         models.FullData.temperature_before_triplex,
         models.FullData.pressure_before_triplex,
@@ -123,6 +126,8 @@ def latest_operating_conditions(db: Session) -> dict[str, Any] | None:
     query = db.query(models.FullData)
     for field in required_fields:
         query = query.filter(field.isnot(None), field != 0)
+    if at is not None:
+        query = query.filter(models.FullData.timestamp <= at)
     row = query.order_by(models.FullData.timestamp.desc()).first()
     if row is None:
         return None
@@ -134,4 +139,5 @@ def latest_operating_conditions(db: Session) -> dict[str, Any] | None:
         "surface_temp": row.surface_temp,
         "temperature_before_triplex": row.temperature_before_triplex,
         "pressure_before_triplex": row.pressure_before_triplex,
+        "flow_bpm": row.flow_bpm,
     }

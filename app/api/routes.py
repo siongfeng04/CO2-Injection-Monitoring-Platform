@@ -68,6 +68,19 @@ def prediction(db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/prediction/outlook")
+def prediction_outlook(at: str = None, db: Session = Depends(get_db)):
+    """Next-hour CBHP and BHT projection from the latest reading at or before ``at`` (the dashboard's simulated time)."""
+    try:
+        at_dt = datetime.fromisoformat(at) if at else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="at must be an ISO timestamp") from exc
+    try:
+        return prediction_service.outlook_at(db, at_dt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/injection-optimization")
 def injection_optimization(payload: dict, db: Session = Depends(get_db)):
     try:
@@ -77,8 +90,13 @@ def injection_optimization(payload: dict, db: Session = Depends(get_db)):
 
 
 @router.get("/injection-optimization/defaults")
-def injection_optimization_defaults(db: Session = Depends(get_db)):
-    conditions = latest_operating_conditions(db)
+def injection_optimization_defaults(at: str = None, db: Session = Depends(get_db)):
+    """Operating conditions for the optimizer: the latest complete reading at or before ``at`` (simulated time)."""
+    try:
+        at_dt = datetime.fromisoformat(at) if at else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="at must be an ISO timestamp") from exc
+    conditions = latest_operating_conditions(db, at_dt)
     return {"conditions": conditions}
 
 
@@ -90,6 +108,7 @@ def _full_data_row(row):
         "annulus_psi": row.annulus_psi,
         "injection_rate": row.flow_bpm,
         "flow_bpm": row.flow_bpm,
+        "flowrate_meter": row.flowrate_meter,
         "pump_speed": row.pump_speed,
         "bhp": row.bhp,
         "corrected_bottom_hole_pressure": row.corrected_bhp,

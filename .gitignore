@@ -46,3 +46,6 @@ Thumbs.db
 
 # Knowledge-base embedding cache (rebuilt automatically)
 docs/knowledge_base/.embeddings_cache.json
+
+# SEGY event-detection cache (rebuilt automatically)
+data/segy/.event_detection_cache.json
