@@ -35,6 +35,10 @@ RAW_FEATURES = [
     "pressure_before_triplex",
 ]
 INJECTING_FLOW_BPM = 1.0
+# Annulus pressure normally sits around 1,200-1,900 psi; three readings on 20 Sep 2009 reach
+# 10,313 psi, which is a sensor glitch, not a real pressure. Readings above this limit are replaced
+# by the previous valid reading in the same recording period.
+ANNULUS_MAX_PSI = 3000.0
 ROLLING_WINDOW = "30min"
 # Model inputs. Pump speed and calc flow are left out: calc flow is pump speed x 0.0131
 # and pump speed follows flow rate (r = 0.98), so they add no information over flow_bpm.
@@ -66,7 +70,17 @@ THERMAL_FEATURES = [
     f"{column}_ewm{halflife}" for column in THERMAL_MEMORY_COLUMNS for halflife in THERMAL_HALFLIVES_MINUTES
 ] + ["cold_dose"]
 # Thermal memory improved the BHT estimate on unseen periods (mean error 5.36 -> 4.99 °F).
-TARGET_FEATURES = {"corrected_bhp": FEATURES, "bht": FEATURES + THERMAL_FEATURES}
+BHT_ALL_FEATURES = FEATURES + THERMAL_FEATURES
+# BHT feature selection (recursive elimination by held-out permutation importance, then group
+# ablation): the pump-inlet temperature family made BHT worse on unseen periods, so it is left
+# out (mean error 4.99 -> 4.45 °F; chronological test 0.82 -> 0.79 °F). "injecting" is dropped
+# because it is just flow_bpm > 1 and removing it changed nothing.
+BHT_DROPPED_FEATURES = {"injecting"} | {c for c in BHT_ALL_FEATURES if c.startswith("temperature_before_triplex")}
+BHT_FEATURES = [c for c in BHT_ALL_FEATURES if c not in BHT_DROPPED_FEATURES]
+TARGET_FEATURES = {"corrected_bhp": FEATURES, "bht": BHT_FEATURES}
+# The live change models keep the full set: the 60-min BHT change was predicted better with the
+# pump-inlet temperature inputs (1.76 vs 1.98 °F).
+LIVE_BASE_FEATURES = {"corrected_bhp": FEATURES, "bht": BHT_ALL_FEATURES}
 # Projection method per target. "held_constant": the surface-data model predicts the next hour
 # with the latest operating conditions held constant. "live": models predict the change from the
 # latest measured value (BHT: 11-65% more accurate than assuming no change on unseen periods).
@@ -80,6 +94,16 @@ TARGETS = {
     "temperature": ("bht", "Bottom-Hole Temperature"),
 }
 UNITS = {"corrected_bhp": "psi", "bht": "°F"}
+# Unexplained spikes: the gauge reading departs from its centred 31-min median by more than the
+# threshold while flow rate and surface temperature stay steady, so no surface-based model can
+# see them (e.g. BHT fell 113 -> 94 °F and recovered within 10 min on 25 Sep 2009 04:49-04:58
+# with every surface reading unchanged). Flagged and reported, not removed from training.
+SPIKE_THRESHOLD = {"bht": 5.0}
+SPIKE_WINDOW = "31min"
+SPIKE_STEADY_LIMITS = {"flow_bpm": 0.5, "surface_temp": 2.0}
+# Only after an hour of continuous injection: the dip-and-recover in the first minutes after the
+# pumps start is real cooling (cold CO2 reaching the gauge), which the model should learn.
+SPIKE_MIN_INJECTING_MINUTES = 60
 # The optimizer varies flow rate, so it uses instantaneous surface inputs only. Pump speed
 # is derived from the searched flow rate (they move together) rather than held fixed.
 OPTIMIZATION_FEATURES = {
@@ -208,6 +232,9 @@ def _prepare_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     frame["period"] = _recording_period(frame["timestamp"])
     frame = frame[frame["period"] >= 0].reset_index(drop=True)
     frame = _fill_pump_speed(frame)
+    glitch = frame["annulus_psi"] > ANNULUS_MAX_PSI
+    previous_valid = frame["annulus_psi"].mask(glitch).groupby(frame["period"]).ffill()
+    frame.loc[glitch, "annulus_psi"] = previous_valid[glitch]
     frame[RAW_FEATURES] = frame[RAW_FEATURES].fillna(0)
     for column in ["bhp", "corrected_bhp", "bht"]:
         frame[column] = frame[column].interpolate(method="linear").fillna(0)
@@ -243,7 +270,7 @@ def _band(errors: np.ndarray) -> float | None:
 
 def _period_holdout(frame: pd.DataFrame, target: str, model, features: list[str]):
     """Predict each recording period with a model trained on the other periods (injecting rows scored)."""
-    periods, residuals = [], []
+    periods, residuals, actuals = [], [], []
     for period in sorted(frame["period"].unique()):
         train, test = frame[frame["period"] != period], frame[frame["period"] == period]
         test = test[test["injecting"] == 1]
@@ -258,11 +285,61 @@ def _period_holdout(frame: pd.DataFrame, target: str, model, features: list[str]
                 "rows": int(len(test)),
                 "mae": float(mean_absolute_error(test[target], predicted)),
                 "rmse": float(np.sqrt(mean_squared_error(test[target], predicted))),
+                "r2": float(r2_score(test[target], predicted)),
                 "baseline_mae": float(mean_absolute_error(test[target], baseline)),
             }
         )
         residuals.append(test[target].to_numpy() - predicted)
-    return periods, (np.concatenate(residuals) if residuals else np.array([]))
+        actuals.append(test[target].to_numpy())
+    if not residuals:
+        return periods, np.array([]), np.array([])
+    return periods, np.concatenate(residuals), np.concatenate(actuals)
+
+
+def _centred_median_gap(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Absolute gap between each reading and the centred rolling median of its recording period."""
+    median = (
+        frame.set_index("timestamp").groupby("period")[column]
+        .transform(lambda s: s.rolling(SPIKE_WINDOW, center=True, min_periods=1).median())
+        .to_numpy()
+    )
+    return (frame[column] - median).abs()
+
+
+def _unexplained_spikes(frame: pd.DataFrame, target: str) -> pd.Series:
+    """True where the target jumps away from its local level while the surface readings stay steady."""
+    threshold = SPIKE_THRESHOLD.get(target)
+    if threshold is None:
+        return pd.Series(False, index=frame.index)
+    flagged = (_centred_median_gap(frame, target) > threshold) & (frame["minutes_injecting"] >= SPIKE_MIN_INJECTING_MINUTES)
+    for column, limit in SPIKE_STEADY_LIMITS.items():
+        flagged &= _centred_median_gap(frame, column) <= limit
+    return flagged
+
+
+def _spike_events(timestamps: pd.Series, values: pd.Series, flagged: pd.Series) -> list[dict[str, Any]]:
+    """Group flagged readings into events (gaps over 5 minutes start a new event)."""
+    hits = pd.DataFrame({"timestamp": timestamps, "value": values})[flagged.to_numpy()]
+    if hits.empty:
+        return []
+    event_id = (hits["timestamp"].diff() > pd.Timedelta(minutes=5)).cumsum()
+    return [
+        {
+            "start": group["timestamp"].min().isoformat(),
+            "end": group["timestamp"].max().isoformat(),
+            "rows": int(len(group)),
+            "min": float(group["value"].min()),
+            "max": float(group["value"].max()),
+        }
+        for _, group in hits.groupby(event_id)
+    ]
+
+
+def _pooled_r2(residuals: np.ndarray, actuals: np.ndarray) -> float | None:
+    """R² over every held-out period's readings together (each scored by a model that never saw its period)."""
+    if actuals.size < 2 or np.var(actuals) == 0:
+        return None
+    return float(1 - np.sum(residuals**2) / np.sum((actuals - actuals.mean()) ** 2))
 
 
 def _select_model(frame: pd.DataFrame, target: str, features: list[str]) -> dict[str, Any]:
@@ -296,6 +373,7 @@ def _select_model(frame: pd.DataFrame, target: str, features: list[str]) -> dict
         "holdout_periods": holdouts[best][0],
         "band_recent": _band(recent_errors),
         "band_new_period": _band(holdouts[best][1]),
+        "holdout_r2": _pooled_r2(holdouts[best][1], holdouts[best][2]),
         "final_model": clone(_candidates()[best]).fit(x, y),
     }
 
@@ -340,7 +418,7 @@ def _train_live_models(frame: pd.DataFrame, target: str) -> dict[str, Any]:
     90% quantile of held-out errors of whichever method is used.
     """
     data = _add_live_features(frame, target)
-    features = TARGET_FEATURES[target] + _live_feature_names(target)
+    features = LIVE_BASE_FEATURES[target] + _live_feature_names(target)
     horizons = []
     for minutes in FORECAST_HORIZONS_MINUTES:
         data["future_change"] = _value_at_offset(data, target, minutes) - data[target]
@@ -574,6 +652,8 @@ def _fit_target(frame: pd.DataFrame, target: str, label: str) -> tuple[dict[str,
     x, y = frame[features], frame[target]
     y_test, best_predicted = y.iloc[cut:].to_numpy(), selection["chrono_predicted"]
     injecting_test = selection["injecting_test"]
+    spikes = _unexplained_spikes(frame, target)
+    spike_test = spikes.iloc[cut:].to_numpy()
     test_frame = pd.DataFrame(
         {
             "timestamp": frame["timestamp"].iloc[cut:].dt.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -581,8 +661,10 @@ def _fit_target(frame: pd.DataFrame, target: str, label: str) -> tuple[dict[str,
             "predicted": best_predicted,
             "residual": y_test - best_predicted,
             "injecting": injecting_test,
+            "unexplained_spike": spike_test,
         }
     )
+    clean_test = ~spike_test
     random_x_train, random_x_test, random_y_train, random_y_test = train_test_split(
         x, y, test_size=TEST_FRACTION, random_state=42
     )
@@ -626,6 +708,23 @@ def _fit_target(frame: pd.DataFrame, target: str, label: str) -> tuple[dict[str,
         ),
         "random_split_metrics": _metrics(random_y_test.to_numpy(), random_model.predict(random_x_test)),
         "period_holdout": selection["holdout_periods"],
+        # R² over all held-out periods together: the headline accuracy, since the reading varies there.
+        "holdout_r2": selection["holdout_r2"],
+        "test_target_std": float(np.std(y_test)),
+        "unexplained_spikes": {
+            "rule": (
+                f"Reading more than {SPIKE_THRESHOLD.get(target):g} {unit} from its centred "
+                f"{SPIKE_WINDOW.replace('min', '-minute')} median "
+                f"after at least {SPIKE_MIN_INJECTING_MINUTES} min of injection, while flow rate and surface "
+                "temperature stayed steady."
+            ) if target in SPIKE_THRESHOLD else None,
+            "events": _spike_events(frame["timestamp"], frame[target], spikes),
+            "test_rows": int(spike_test.sum()),
+            "test_metrics_excluding": (
+                _metrics(y_test[clean_test], best_predicted[clean_test])
+                if spike_test.any() and clean_test.sum() >= 2 else None
+            ),
+        },
         "interval": {
             "quantile": INTERVAL_QUANTILE,
             "unit": unit,

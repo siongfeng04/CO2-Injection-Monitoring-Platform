@@ -2008,11 +2008,17 @@ def render_model_performance(target_key, target_data, row_count):
         st.markdown(f"Selected model: **{best}**")
         st.badge("Chosen on unseen periods", color="green", icon=":material/verified:", help=evaluation.get("selection"))
 
+    spikes = evaluation.get("unexplained_spikes") or {}
+    holdout_r2 = evaluation.get("holdout_r2")
     with st.container(horizontal=True):
+        if holdout_r2 is not None:
+            show_metric(st, "Accuracy on unseen periods (R²)", f"{holdout_r2:.3f}", border=True,
+                        help="Each recording period is predicted by a model trained only on the other periods, "
+                             "and R² is taken over all of those readings together (injecting readings).")
         if best_metrics:
-            show_metric(st, "Accuracy on unseen data (R²)", f"{best_metrics['r2']:.3f}", border=True,
-                        help="Score on the most recent 20% of readings, which the model never saw. "
-                             "R² can be low when the reading barely changes in that window; check the average error too.")
+            show_metric(st, "R², recent 20%", f"{best_metrics['r2']:.3f}", border=True,
+                        help="Score on the most recent 20% of readings. R² compares the error with how much the "
+                             "reading varies; when it barely changes in that window, R² is low even if the error is small.")
         if injecting_metrics:
             show_metric(st, "Average error while injecting", f"{injecting_metrics['mae']:.2f} {unit}", border=True,
                         help="Average absolute error on injecting readings in the unseen recent data.")
@@ -2027,20 +2033,52 @@ def render_model_performance(target_key, target_data, row_count):
             f"{evaluation['description']} Test window {pd.to_datetime(evaluation['test_start']):%d %b %H:%M} to "
             f"{pd.to_datetime(evaluation['test_end']):%d %b %H:%M} ({evaluation['test_rows']:,} readings)."
         )
+    if best_metrics and holdout_r2 is not None and best_metrics["r2"] < 0.3 and evaluation.get("test_target_std") is not None:
+        note = (
+            f"The recent-20% R² is low because {spec['short']} barely varied in that window "
+            f"(standard deviation {evaluation['test_target_std']:.1f} {unit}), so a few large misses dominate it. "
+            "The unseen-period R² is the fairer accuracy score."
+        )
+        excluding = spikes.get("test_metrics_excluding")
+        if spikes.get("test_rows") and excluding:
+            note += (
+                f" {spikes['test_rows']} readings in the window are unexplained spikes (shaded on the chart below); "
+                f"without them the recent average error is {excluding['mae']:.2f} {unit}."
+            )
+        st.caption(note)
 
     test_df = pd.DataFrame(target_data.get("test_predictions", []))
     if test_df.empty:
         st.warning("No test predictions were returned for this target.")
         return
     test_df["timestamp"] = pd.to_datetime(test_df["timestamp"])
+    test_events = [
+        event for event in spikes.get("events", [])
+        if pd.to_datetime(event["end"]) >= test_df["timestamp"].min()
+    ]
 
     over_time = go.Figure()
     over_time.add_trace(go.Scattergl(x=test_df["timestamp"], y=test_df["actual"], mode="lines", name="Measured",
                                      line=dict(color=BRAND_GREY, width=1.6)))
     over_time.add_trace(go.Scattergl(x=test_df["timestamp"], y=test_df["predicted"], mode="lines", name="Predicted",
                                      line=dict(color=BRAND_GREEN, width=1.6)))
+    for event in test_events:
+        over_time.add_vrect(
+            x0=pd.to_datetime(event["start"]) - pd.Timedelta(minutes=1), x1=pd.to_datetime(event["end"]) + pd.Timedelta(minutes=1),
+            fillcolor=BRAND_RED, opacity=0.15, line_width=0,
+            annotation_text="Unexplained spike", annotation_position="top left",
+            annotation_font=dict(color=BRAND_RED, size=11),
+        )
     over_time.update_layout(title_text=f"Measured vs predicted on unseen data ({unit})")
     show_chart(style_prediction_figure(over_time, height=320))
+    if test_events:
+        st.caption(
+            "Shaded: unexplained spike. " + (spikes.get("rule") or "") + " No surface-based model can foresee these, "
+            "so they are flagged rather than removed: " + "; ".join(
+                f"{pd.to_datetime(e['start']):%d %b %H:%M}–{pd.to_datetime(e['end']):%H:%M} "
+                f"({e['min']:.1f}–{e['max']:.1f} {unit})" for e in test_events
+            ) + "."
+        )
 
     chart_col1, chart_col2 = st.columns(2)
     with chart_col1:
@@ -2049,11 +2087,18 @@ def render_model_performance(target_key, target_data, row_count):
         scatter = go.Figure()
         scatter.add_trace(go.Scatter(x=[low, high], y=[low, high], mode="lines", name="Perfect prediction",
                                      line=dict(color=BRAND_GREY, dash="dash", width=1), hoverinfo="skip"))
+        spike_rows = test_df["unexplained_spike"].astype(bool) if "unexplained_spike" in test_df else pd.Series(False, index=test_df.index)
         scatter.add_trace(go.Scattergl(
-            x=test_df["actual"], y=test_df["predicted"], mode="markers", name="Readings",
+            x=test_df.loc[~spike_rows, "actual"], y=test_df.loc[~spike_rows, "predicted"], mode="markers", name="Readings",
             marker=dict(color=BRAND_GREEN, size=5, opacity=0.35),
             hovertemplate=f"Measured %{{x:,.1f}} {unit}<br>Predicted %{{y:,.1f}} {unit}<extra></extra>",
         ))
+        if spike_rows.any():
+            scatter.add_trace(go.Scattergl(
+                x=test_df.loc[spike_rows, "actual"], y=test_df.loc[spike_rows, "predicted"], mode="markers",
+                name="Unexplained spike", marker=dict(color=BRAND_RED, size=6, opacity=0.7),
+                hovertemplate=f"Spike: measured %{{x:,.1f}} {unit}<br>Predicted %{{y:,.1f}} {unit}<extra></extra>",
+            ))
         scatter.update_layout(title_text="Predicted vs measured", xaxis_title=f"Measured ({unit})", yaxis_title=f"Predicted ({unit})")
         style_prediction_figure(scatter, height=320, unified_hover=False)
         scatter.update_xaxes(title_text=f"Measured ({unit})")
@@ -2099,13 +2144,13 @@ def render_model_performance(target_key, target_data, row_count):
         if period_holdout:
             holdout_df = pd.DataFrame(period_holdout).rename(columns={
                 "period": "Held-out recording period", "rows": "Injecting readings",
-                "mae": f"Model error ({unit})", "rmse": f"Model RMSE ({unit})",
+                "mae": f"Model error ({unit})", "rmse": f"Model RMSE ({unit})", "r2": "Model R²",
                 "baseline_mae": f"Predict-the-average error ({unit})",
             })
             st.markdown("**Harder test: predicting a whole recording period the model never saw**")
             show_table(holdout_df, f"{spec['label']} held-out period test", hide_index=True,
                        column_config={column: st.column_config.NumberColumn(format="%.2f")
-                                      for column in holdout_df.columns if "error" in column or "RMSE" in column})
+                                      for column in holdout_df.columns if "error" in column or "RMSE" in column or "R²" in column})
         if evaluation.get("random_split_metrics"):
             st.caption(
                 f"For comparison, the earlier random-split test scored R² {evaluation['random_split_metrics']['r2']:.3f}. "
