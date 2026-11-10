@@ -77,7 +77,13 @@ BHT_ALL_FEATURES = FEATURES + THERMAL_FEATURES
 # because it is just flow_bpm > 1 and removing it changed nothing.
 BHT_DROPPED_FEATURES = {"injecting"} | {c for c in BHT_ALL_FEATURES if c.startswith("temperature_before_triplex")}
 BHT_FEATURES = [c for c in BHT_ALL_FEATURES if c not in BHT_DROPPED_FEATURES]
-TARGET_FEATURES = {"corrected_bhp": FEATURES, "bht": BHT_FEATURES}
+# CBHP uses the raw surface readings only. Pressure responds almost at once to surface conditions,
+# and the injection-history inputs let the model memorise each period's pressure level, which does
+# not carry over to a new period: on held-out periods R² 0.043 -> 0.284 and mean error 33.3 -> 29.6
+# psi (recent-20% error rises 3.4 -> 6.3 psi). BHT keeps its history and thermal-memory inputs,
+# without which its held-out R² falls from 0.74 to about 0.
+CBHP_FEATURES = list(RAW_FEATURES)
+TARGET_FEATURES = {"corrected_bhp": CBHP_FEATURES, "bht": BHT_FEATURES}
 # The live change models keep the full set: the 60-min BHT change was predicted better with the
 # pump-inlet temperature inputs (1.76 vs 1.98 °F).
 LIVE_BASE_FEATURES = {"corrected_bhp": FEATURES, "bht": BHT_ALL_FEATURES}
@@ -635,6 +641,8 @@ def _out_of_range(training: pd.DataFrame, row: pd.Series) -> list[str]:
         training.attrs["feature_ranges"] = ranges
     flagged = []
     for column in RANGE_CHECK_FEATURES:
+        if column not in row.index:  # only inputs this model uses (CBHP has no history inputs)
+            continue
         low, high = ranges[column]
         if not low <= row[column] <= high:
             flagged.append(f"{column} = {row[column]:,.2f} (training range {low:,.2f} to {high:,.2f})")
