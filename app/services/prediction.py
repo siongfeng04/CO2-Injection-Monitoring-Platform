@@ -83,6 +83,16 @@ BHT_FEATURES = [c for c in BHT_ALL_FEATURES if c not in BHT_DROPPED_FEATURES]
 # psi (recent-20% error rises 3.4 -> 6.3 psi). BHT keeps its history and thermal-memory inputs,
 # without which its held-out R² falls from 0.74 to about 0.
 CBHP_FEATURES = list(RAW_FEATURES)
+# Headline unseen-period R² per target. "steady" scores injecting readings from STEADY_AFTER_MINUTES
+# after each period's first injection: CBHP cannot be predicted during start-up (e.g. the first
+# injection on 20 Sep 2009 jumped 1,594 -> 2,037 psi at ~1 bpm, likely wellbore fluid being
+# displaced by CO2), so its headline covers steady injection (R² 0.785 vs 0.284 on all readings).
+# BHT keeps all readings: its start-up cooling is the main variation and the model captures it.
+# The dashboard always shows the all-readings value next to a steady headline.
+STEADY_AFTER_MINUTES = 60
+HEADLINE_R2_BASIS = {"corrected_bhp": "steady", "bht": "all"}
+# Trailing median applied to a target's predictions (see _smooth_predictions).
+OUTPUT_SMOOTHING = {"corrected_bhp": "2min"}
 TARGET_FEATURES = {"corrected_bhp": CBHP_FEATURES, "bht": BHT_FEATURES}
 # The live change models keep the full set: the 60-min BHT change was predicted better with the
 # pump-inlet temperature inputs (1.76 vs 1.98 °F).
@@ -276,13 +286,18 @@ def _band(errors: np.ndarray) -> float | None:
 
 def _period_holdout(frame: pd.DataFrame, target: str, model, features: list[str]):
     """Predict each recording period with a model trained on the other periods (injecting rows scored)."""
-    periods, residuals, actuals = [], [], []
+    periods, residuals, actuals, steady = [], [], [], []
     for period in sorted(frame["period"].unique()):
-        train, test = frame[frame["period"] != period], frame[frame["period"] == period]
-        test = test[test["injecting"] == 1]
+        train, held_out = frame[frame["period"] != period], frame[frame["period"] == period]
+        is_test = (held_out["injecting"] == 1).to_numpy()
+        test = held_out[is_test]
         if len(test) < 2 or train.empty:
             continue
-        predicted = clone(model).fit(train[features], train[target]).predict(test[features])
+        since_start = (test["timestamp"] - test["timestamp"].min()).dt.total_seconds() / 60
+        steady.append((since_start >= STEADY_AFTER_MINUTES).to_numpy())
+        # Predict the whole period so output smoothing sees consecutive readings, then score injecting rows.
+        fitted = clone(model).fit(train[features], train[target])
+        predicted = _smooth_predictions(held_out, fitted.predict(held_out[features]), target)[is_test]
         baseline = np.full(len(test), train.loc[train["injecting"] == 1, target].mean())
         start, end = RECORDING_PERIODS[period]
         periods.append(
@@ -298,8 +313,27 @@ def _period_holdout(frame: pd.DataFrame, target: str, model, features: list[str]
         residuals.append(test[target].to_numpy() - predicted)
         actuals.append(test[target].to_numpy())
     if not residuals:
-        return periods, np.array([]), np.array([])
-    return periods, np.concatenate(residuals), np.concatenate(actuals)
+        return periods, np.array([]), np.array([]), np.array([], dtype=bool)
+    return periods, np.concatenate(residuals), np.concatenate(actuals), np.concatenate(steady)
+
+
+def _smooth_predictions(rows: pd.DataFrame, predicted: np.ndarray, target: str) -> np.ndarray:
+    """Trailing rolling median of a model's predictions within each recording period (past readings only).
+
+    Tree models output a staircase: a 1 psi wobble of an input sitting on a split threshold flips
+    the CBHP prediction by ~9 psi. A 2-min median removes those flips (jumps over 5 psi in the recent
+    test window 36 -> 20) and slightly improved every score (unseen-period steady R² 0.785 -> 0.791,
+    recent R² 0.842 -> 0.872). Smoothing the inputs instead cost accuracy on unseen periods.
+    """
+    window = OUTPUT_SMOOTHING.get(target)
+    if not window or len(predicted) == 0:
+        return predicted
+    series = pd.Series(predicted, index=pd.DatetimeIndex(rows["timestamp"]))
+    return (
+        series.groupby(rows["period"].to_numpy())
+        .transform(lambda s: s.rolling(window, min_periods=1).median())
+        .to_numpy()
+    )
 
 
 def _centred_median_gap(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -361,7 +395,7 @@ def _select_model(frame: pd.DataFrame, target: str, features: list[str]) -> dict
     scores, chrono_fitted, chrono_predicted, holdouts = {}, {}, {}, {}
     for name, model in _candidates().items():
         chrono_fitted[name] = model.fit(x_train, y_train)
-        chrono_predicted[name] = model.predict(x_test)
+        chrono_predicted[name] = _smooth_predictions(frame.iloc[cut:], model.predict(x_test), target)
         holdouts[name] = _period_holdout(frame, target, model, features)
         scores[name] = _metrics(y_test.to_numpy(), chrono_predicted[name])
         held_out_maes = [period["mae"] for period in holdouts[name][0]]
@@ -380,6 +414,10 @@ def _select_model(frame: pd.DataFrame, target: str, features: list[str]) -> dict
         "band_recent": _band(recent_errors),
         "band_new_period": _band(holdouts[best][1]),
         "holdout_r2": _pooled_r2(holdouts[best][1], holdouts[best][2]),
+        "holdout_r2_steady": _pooled_r2(holdouts[best][1][holdouts[best][3]], holdouts[best][2][holdouts[best][3]]),
+        "holdout_mae_steady": (
+            float(np.mean(np.abs(holdouts[best][1][holdouts[best][3]]))) if holdouts[best][3].any() else None
+        ),
         "final_model": clone(_candidates()[best]).fit(x, y),
     }
 
@@ -718,6 +756,10 @@ def _fit_target(frame: pd.DataFrame, target: str, label: str) -> tuple[dict[str,
         "period_holdout": selection["holdout_periods"],
         # R² over all held-out periods together: the headline accuracy, since the reading varies there.
         "holdout_r2": selection["holdout_r2"],
+        "holdout_r2_steady": selection["holdout_r2_steady"],
+        "holdout_mae_steady": selection["holdout_mae_steady"],
+        "headline_r2_basis": HEADLINE_R2_BASIS[target],
+        "steady_after_minutes": STEADY_AFTER_MINUTES,
         "test_target_std": float(np.std(y_test)),
         "unexplained_spikes": {
             "rule": (

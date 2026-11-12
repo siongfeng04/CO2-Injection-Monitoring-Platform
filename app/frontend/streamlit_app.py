@@ -14,6 +14,7 @@ import segyio
 from pathlib import Path
 from datetime import date, datetime, timedelta
 import tempfile
+import time
 from streamlit_autorefresh import st_autorefresh
 from streamlit.errors import StreamlitAPIException
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -1401,6 +1402,14 @@ def build_postgres_chat_context(question, history=None, end_timestamp=None):
     return "\n\n".join(summary), chart, None
 
 
+def chat_answer_footer(answered_by, response_time=None):
+    """Caption under a chatbot answer: who answered and how long it took (seconds)."""
+    footer = f"Answered by: {answered_by}"
+    if response_time is not None:
+        footer += f" · Response time: {response_time:.2f} s"
+    return footer
+
+
 def render_postgres_chat_answer(question, history=None, end_timestamp=None):
     """Answer every PostgreSQL question with GPT; returns ``(answer, chart, answered_by, sources)``."""
     local_answer, chart, knowledge_results = build_postgres_chat_context(question, history, end_timestamp)
@@ -2010,8 +2019,16 @@ def render_model_performance(target_key, target_data, row_count):
 
     spikes = evaluation.get("unexplained_spikes") or {}
     holdout_r2 = evaluation.get("holdout_r2")
+    steady_headline = evaluation.get("headline_r2_basis") == "steady" and evaluation.get("holdout_r2_steady") is not None
+    steady_minutes = evaluation.get("steady_after_minutes", 60)
     with st.container(horizontal=True):
-        if holdout_r2 is not None:
+        if steady_headline:
+            show_metric(st, "Accuracy on unseen periods (R²)", f"{evaluation['holdout_r2_steady']:.3f}", border=True,
+                        help=f"Steady injection: each recording period is predicted by a model trained only on the other "
+                             f"periods, scoring injecting readings from {steady_minutes} min after injection starts. "
+                             f"Start-up readings are excluded because the start-up pressure jump (e.g. 1,594 to 2,037 psi on "
+                             f"20 Sep) cannot be seen in surface data. All injecting readings: R² {holdout_r2:.3f}.")
+        elif holdout_r2 is not None:
             show_metric(st, "Accuracy on unseen periods (R²)", f"{holdout_r2:.3f}", border=True,
                         help="Each recording period is predicted by a model trained only on the other periods, "
                              "and R² is taken over all of those readings together (injecting readings).")
@@ -2032,6 +2049,14 @@ def render_model_performance(target_key, target_data, row_count):
         st.caption(
             f"{evaluation['description']} Test window {pd.to_datetime(evaluation['test_start']):%d %b %H:%M} to "
             f"{pd.to_datetime(evaluation['test_end']):%d %b %H:%M} ({evaluation['test_rows']:,} readings)."
+        )
+    if steady_headline:
+        steady_mae = evaluation.get("holdout_mae_steady")
+        st.caption(
+            f"Unseen-period R² covers steady injection (from {steady_minutes} min after injection starts in each period"
+            + (f"; average error {steady_mae:.1f} {unit}" if steady_mae is not None else "")
+            + f"). Including start-up readings it is {holdout_r2:.3f}: the start-up pressure jump of the first injection "
+            "cannot be predicted from surface measurements."
         )
     if best_metrics and holdout_r2 is not None and best_metrics["r2"] < 0.3 and evaluation.get("test_target_std") is not None:
         note = (
@@ -3015,7 +3040,7 @@ elif page == "AI Chatbot":
             st.caption(f"Source: {message['source']}")
             st.markdown(message["content"])
             if message.get("answered_by"):
-                st.caption(f"Answered by: {message['answered_by']}")
+                st.caption(chat_answer_footer(message["answered_by"], message.get("response_time")))
             if message.get("chart") is not None:
                 st.plotly_chart(
                     message["chart"],
@@ -3032,6 +3057,8 @@ elif page == "AI Chatbot":
             st.caption(f"Source: {message_source}")
             st.markdown(prompt)
 
+        # Response time: from submitting the question until the answer (and any chart) is ready.
+        started = time.perf_counter()
         if source_key == "postgresql":
             answer, chart, answered_by, answer_source = render_postgres_chat_answer(
                 prompt,
@@ -3045,11 +3072,15 @@ elif page == "AI Chatbot":
                 history=st.session_state[history_key],
                 all_files=segy_all_files,
             )
-        st.session_state[history_key].append({"role": "assistant", "content": answer, "source": answer_source, "chart": chart, "answered_by": answered_by})
+        response_time = time.perf_counter() - started
+        st.session_state[history_key].append({
+            "role": "assistant", "content": answer, "source": answer_source, "chart": chart,
+            "answered_by": answered_by, "response_time": response_time,
+        })
         with st.chat_message("assistant"):
             st.caption(f"Source: {answer_source}")
             st.markdown(answer)
-            st.caption(f"Answered by: {answered_by}")
+            st.caption(chat_answer_footer(answered_by, response_time))
             if chart is not None:
                 st.plotly_chart(
                     chart,
