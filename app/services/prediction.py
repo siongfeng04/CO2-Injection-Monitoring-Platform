@@ -14,6 +14,7 @@ from sklearn.model_selection import train_test_split
 from sqlalchemy import func
 
 from app import models
+from app.services import alerts
 from app.services.fulldata import full_data_rows
 
 RECORDING_PERIODS = [
@@ -248,7 +249,12 @@ def _prepare_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     frame["period"] = _recording_period(frame["timestamp"])
     frame = frame[frame["period"] >= 0].reset_index(drop=True)
     frame = _fill_pump_speed(frame)
+    # Kept for the alerts (sensor faults) before the readings are cleaned below.
+    frame["annulus_raw"] = frame["annulus_psi"]
+    for column in ["corrected_bhp", "bht"]:
+        frame[f"{column}_missing"] = frame[column].isna()
     glitch = frame["annulus_psi"] > ANNULUS_MAX_PSI
+    frame["annulus_glitch"] = glitch
     previous_valid = frame["annulus_psi"].mask(glitch).groupby(frame["period"]).ffill()
     frame.loc[glitch, "annulus_psi"] = previous_valid[glitch]
     frame[RAW_FEATURES] = frame[RAW_FEATURES].fillna(0)
@@ -285,8 +291,13 @@ def _band(errors: np.ndarray) -> float | None:
 
 
 def _period_holdout(frame: pd.DataFrame, target: str, model, features: list[str]):
-    """Predict each recording period with a model trained on the other periods (injecting rows scored)."""
+    """Predict each recording period with a model trained on the other periods (injecting rows scored).
+
+    Returns ``(periods, residuals, actuals, steady, predictions)``; ``predictions`` holds every reading's
+    prediction from the model that did not see its period (used by the model-mismatch alerts).
+    """
     periods, residuals, actuals, steady = [], [], [], []
+    predictions = pd.Series(np.nan, index=frame.index)
     for period in sorted(frame["period"].unique()):
         train, held_out = frame[frame["period"] != period], frame[frame["period"] == period]
         is_test = (held_out["injecting"] == 1).to_numpy()
@@ -297,7 +308,9 @@ def _period_holdout(frame: pd.DataFrame, target: str, model, features: list[str]
         steady.append((since_start >= STEADY_AFTER_MINUTES).to_numpy())
         # Predict the whole period so output smoothing sees consecutive readings, then score injecting rows.
         fitted = clone(model).fit(train[features], train[target])
-        predicted = _smooth_predictions(held_out, fitted.predict(held_out[features]), target)[is_test]
+        period_predicted = _smooth_predictions(held_out, fitted.predict(held_out[features]), target)
+        predictions.loc[held_out.index] = period_predicted
+        predicted = period_predicted[is_test]
         baseline = np.full(len(test), train.loc[train["injecting"] == 1, target].mean())
         start, end = RECORDING_PERIODS[period]
         periods.append(
@@ -313,8 +326,8 @@ def _period_holdout(frame: pd.DataFrame, target: str, model, features: list[str]
         residuals.append(test[target].to_numpy() - predicted)
         actuals.append(test[target].to_numpy())
     if not residuals:
-        return periods, np.array([]), np.array([]), np.array([], dtype=bool)
-    return periods, np.concatenate(residuals), np.concatenate(actuals), np.concatenate(steady)
+        return periods, np.array([]), np.array([]), np.array([], dtype=bool), predictions
+    return periods, np.concatenate(residuals), np.concatenate(actuals), np.concatenate(steady), predictions
 
 
 def _smooth_predictions(rows: pd.DataFrame, predicted: np.ndarray, target: str) -> np.ndarray:
@@ -418,6 +431,7 @@ def _select_model(frame: pd.DataFrame, target: str, features: list[str]) -> dict
         "holdout_mae_steady": (
             float(np.mean(np.abs(holdouts[best][1][holdouts[best][3]]))) if holdouts[best][3].any() else None
         ),
+        "holdout_predictions": holdouts[best][4],
         "final_model": clone(_candidates()[best]).fit(x, y),
     }
 
@@ -731,6 +745,13 @@ def _fit_target(frame: pd.DataFrame, target: str, label: str) -> tuple[dict[str,
         "model": selection["final_model"],
         "band": selection["band_recent"] or 0.0,
         "live": _train_live_models(frame, target) if method == "live" else None,
+        # For the model-mismatch alerts.
+        "twin": {
+            "label": label,
+            "unit": unit,
+            "predicted": selection["holdout_predictions"].to_numpy(),
+            "band": selection["band_new_period"],
+        },
     }
     forecast, future_predictions = _projection(frame, target, artifact, len(frame) - 1)
 
@@ -822,9 +843,36 @@ def analyze_fulldata(db) -> dict[str, Any]:
         artifacts = {}
         for key_name, (target, label) in TARGETS.items():
             result[key_name], artifacts[key_name] = _fit_target(frame, target, label)
+        flagged = alerts.flag_readings(
+            frame, {target: artifacts[key_name]["twin"] for key_name, (target, _) in TARGETS.items()}
+        )
         with _cache_lock:
-            _analysis_cache.update({"key": key, "result": result, "frame": frame, "artifacts": artifacts})
+            _analysis_cache.update(
+                {"key": key, "result": result, "frame": frame, "artifacts": artifacts, "alert_flags": flagged}
+            )
         return result
+
+
+def alerts_at(db, at: pd.Timestamp | None) -> dict[str, Any]:
+    """Alert events up to ``at`` (the dashboard's simulated time); ``active`` ones are still happening."""
+    analyze_fulldata(db)
+    with _cache_lock:
+        frame, flagged = _analysis_cache["frame"], _analysis_cache["alert_flags"]
+    at = frame["timestamp"].iloc[-1] if at is None else pd.Timestamp(at)
+    anchor = int(frame["timestamp"].searchsorted(at, side="right")) - 1
+    if anchor < 0:
+        raise ValueError(f"No recorded surface readings at or before {at:%Y-%m-%d %H:%M:%S}")
+    latest = frame["timestamp"].iloc[anchor]
+    events = alerts.alerts_until(flagged, at, latest)
+    if (at - latest).total_seconds() / 60 > 10:  # instruments not recording at this time: nothing is "now"
+        for event in events:
+            event["active"] = False
+    return {
+        "requested_at": at.isoformat(),
+        "latest_reading": latest.isoformat(),
+        "events": events,
+        "rules": alerts.rules_summary(),
+    }
 
 
 def outlook_at(db, at: pd.Timestamp | None) -> dict[str, Any]:

@@ -1936,6 +1936,90 @@ def outlook_chart(test_df, future_df, spec, anchor_time, hours=3):
     return style_prediction_figure(fig, height=300)
 
 
+ALERT_SEVERITY_ORDER = {"critical": 0, "warning": 1}
+
+
+def render_alerts(simulated_time):
+    """Alert warnings at the simulated time (active now) and the log of earlier alerts, from /api/prediction/alerts."""
+    st.subheader("Alerts", anchor=False)
+    response = api_get(
+        "/api/prediction/alerts",
+        params={"at": simulated_time.isoformat()} if simulated_time is not None else None,
+        timeout=120,
+    )
+    if not response:
+        st.info("Alerts are not available yet. Check that the FastAPI backend is running.", icon=":material/info:")
+        return
+    events = response.get("events", [])
+    active = sorted((e for e in events if e["active"]), key=lambda e: (ALERT_SEVERITY_ORDER[e["severity"]], e["start"]))
+    latest = pd.to_datetime(response["latest_reading"])
+    critical = sum(e["severity"] == "critical" for e in active)
+
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f"**Active at {latest:%d %b %Y, %H:%M:%S}**")
+            st.space("stretch")
+            if not active:
+                st.badge("No active alerts", color="green", icon=":material/check_circle:")
+            else:
+                if critical:
+                    st.badge(f"{critical} critical", color="red", icon=":material/error:")
+                if len(active) - critical:
+                    st.badge(f"{len(active) - critical} warning", color="orange", icon=":material/warning:")
+        if not active:
+            st.caption("Every check passed on the latest readings: sensors, operating limits, rates of change and the model check.")
+        for event in active:
+            started = pd.to_datetime(event["start"])
+            text = (
+                f"**{event['parameter']} · {event['category']}**  \n{event['message']}  \n"
+                f"**Action:** {event['action']}  \n"
+                f":small[Since {started:%d %b %H:%M:%S} ({event['duration_minutes']:,.0f} min)]"
+            )
+            if event["severity"] == "critical":
+                st.error(text, icon=":material/error:")
+            else:
+                st.warning(text, icon=":material/warning:")
+        add_page_context(
+            "Active alerts",
+            "; ".join(f"{e['severity']} {e['category']} - {e['message']}" for e in active) or "No active alerts.",
+        )
+
+        earlier = [e for e in events if not e["active"]]
+        with st.expander(f"Alert log · {len(earlier):,} earlier alerts up to the simulated time", icon=":material/history:"):
+            if not earlier:
+                st.caption("No earlier alerts.")
+            else:
+                log = pd.DataFrame(earlier)
+                counts = log.groupby("category").size()
+                st.caption(" · ".join(f"{category}: {count}" for category, count in counts.items()))
+                table = pd.DataFrame({
+                    "Started": pd.to_datetime(log["start"]),
+                    "Minutes": log["duration_minutes"],
+                    "Severity": log["severity"].str.capitalize(),
+                    "Check": log["category"],
+                    "Reading": log["parameter"],
+                    "What happened": log["message"],
+                    "Action": log["action"],
+                })
+                show_table(
+                    table, "Alert log", hide_index=True, height=320,
+                    column_config={
+                        "Started": st.column_config.DatetimeColumn(format="D MMM HH:mm:ss"),
+                        "Minutes": st.column_config.NumberColumn(format="%.1f"),
+                        "What happened": st.column_config.TextColumn(width="large"),
+                        "Action": st.column_config.TextColumn(width="medium"),
+                    },
+                )
+        with st.expander("How alerts are raised", icon=":material/rule:"):
+            for rule in response.get("rules", []):
+                st.markdown(f"- **{rule['category']}:** {rule['rule']}")
+            st.caption(
+                "Limits are the project design-basis values from the CO2 Injection Knowledge Base, not regulatory "
+                "limits. The model check uses, for each recording period, a model trained on the other periods, "
+                "as it would be for a new period."
+            )
+
+
 def render_prediction_outlook(target_key, outlook_target, history_df):
     """Outlook card for one target: projection from /api/prediction/outlook, history = readings up to the simulated time."""
     spec = PREDICTION_TARGETS[target_key]
@@ -2391,7 +2475,10 @@ elif page == "Prediction":
                 )
                 show_chart(bottom_hole_trend_chart(values, spec))
 
-    # 2. Next-hour outlook and 3. model performance, from the trained models.
+    # 2. Alert warnings at the simulated time.
+    render_alerts(simulated_time)
+
+    # 3. Next-hour outlook and 4. model performance, from the trained models.
     if "prediction_analysis" not in st.session_state:
         with st.spinner("Loading the prediction models..."):
             analysis_response = api_get("/api/prediction", timeout=120)

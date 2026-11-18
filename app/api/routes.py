@@ -81,6 +81,19 @@ def prediction_outlook(at: str = None, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/prediction/alerts")
+def prediction_alerts(at: str = None, db: Session = Depends(get_db)):
+    """Alert events (sensor faults, operating limits, rates of change, model mismatch) up to ``at``."""
+    try:
+        at_dt = datetime.fromisoformat(at) if at else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="at must be an ISO timestamp") from exc
+    try:
+        return prediction_service.alerts_at(db, at_dt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/injection-optimization")
 def injection_optimization(payload: dict, db: Session = Depends(get_db)):
     try:
