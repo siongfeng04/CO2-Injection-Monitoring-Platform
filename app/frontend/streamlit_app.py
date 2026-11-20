@@ -270,11 +270,28 @@ def show_metric(container, label, value, **kwargs):
 
 
 # Excel helper: detect the source range, optionally capped at simulated time
+@st.cache_data(show_spinner=False)
+def _load_excel_sheet(file_path, sheet_name, modified):
+    """Read a workbook sheet once (about 8 s); ``modified`` makes a changed file be read again."""
+    return pd.read_excel(file_path, sheet_name=sheet_name, engine="xlrd")
+
+
+def excel_sheet(file_path="data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test"):
+    return _load_excel_sheet(file_path, sheet_name, os.path.getmtime(file_path))
+
+
+@st.cache_data(show_spinner=False)
+def _excel_dates(file_path, sheet_name, col_name, modified):
+    return pd.to_datetime(_load_excel_sheet(file_path, sheet_name, modified)[col_name], errors="coerce").dropna()
+
+
+def excel_dates(file_path, sheet_name, col_name="Date & Time"):
+    return _excel_dates(file_path, sheet_name, col_name, os.path.getmtime(file_path))
+
+
 def get_excel_date_range(file_path="data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", col_name="Date & Time", end_timestamp=None):
     try:
-        df_dates = pd.read_excel(file_path, sheet_name=sheet_name, usecols=[col_name], engine="xlrd")
-        dates = pd.to_datetime(df_dates[col_name], errors="coerce")
-        dates = dates.dropna()
+        dates = excel_dates(file_path, sheet_name, col_name)
         if dates.empty:
             return None, None
         available_end = dates.max()
@@ -301,8 +318,7 @@ def get_current_data(file_path="data/excel/combined_co2_data_only_file.xls", she
             target = get_monitoring_timestamp()
         else:
             target = pd.to_datetime(timestamp)
-        df_dates = pd.read_excel(file_path, sheet_name=sheet_name, usecols=["Date & Time"], engine="xlrd")
-        dates = pd.to_datetime(df_dates["Date & Time"], errors="coerce").dropna()
+        dates = excel_dates(file_path, sheet_name)
         if dates.empty:
             return None
         data_target = min(target, dates.max())
@@ -337,52 +353,71 @@ def query_end_timestamp(end: str) -> str:
     return end if "T" in end else f"{end}T23:59:59"
 
 # Power BI-style interactive metric card
-def metric_card(label: str, value: float, unit: str = "", color: str = "#0078D4", icon: str = "📊", 
-                min_val: float = None, max_val: float = None, trend: float = None):
-    """Create an interactive Power BI-style metric card"""
-    
-    # Format value with 2 decimal places
-    formatted_value = f"{value:.2f}" if isinstance(value, (int, float)) else "N/A"
+# Line icons for the status cards (Lucide, ISC licence), drawn in the card's accent colour.
+CARD_ICONS = {
+    "thermometer": '<path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/>',
+    "gauge": '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+    # Two concentric rings: the tubing inside the casing, with the annulus between them.
+    "annulus": '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/>',
+    "droplets": (
+        '<path d="M7 16.3c2.2 0 4-1.83 4-4.05 0-1.16-.57-2.26-1.71-3.19S7.29 6.75 7 5.3c-.29 1.45-1.14 '
+        '2.84-2.29 3.76S3 11.1 3 12.25c0 2.22 1.8 4.05 4 4.05z"/>'
+        '<path d="M12.56 6.6A10.97 10.97 0 0 0 14 3.02c.5 2.5 2 4.9 4 6.5s3 3.5 3 5.5a6.98 6.98 0 0 1-11.91 4.97"/>'
+    ),
+    "arrow_up": '<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
+    "arrow_down": '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
+    "minus": '<path d="M5 12h14"/>',
+}
+
+
+def card_icon_svg(name, color, size=22, stroke=2.0):
+    return (
+        f"<svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' viewBox='0 0 24 24' fill='none' "
+        f"stroke='{color}' stroke-width='{stroke}' stroke-linecap='round' stroke-linejoin='round'>{CARD_ICONS[name]}</svg>"
+    )
+
+
+def metric_card(label: str, value: float, unit: str = "", color: str = "#00A19C", icon: str = "gauge",
+                min_val: float = None, max_val: float = None, trend: float = None, note: str = None):
+    """Status card: label, value, a line icon in a tinted tile, the short-term trend and the typical range."""
+    formatted_value = f"{value:,.2f}" if isinstance(value, (int, float)) else "N/A"
     card_details = [f"{label}: {formatted_value} {unit}".strip()]
     if trend is not None:
         card_details.append(f"trend {trend:+.2f}% vs the previous 10-reading average")
     if min_val is not None and max_val is not None:
-        card_details.append(f"range {min_val:.1f} - {max_val:.1f} {unit}".strip())
+        card_details.append(f"typical range {min_val:.1f} - {max_val:.1f} {unit}".strip())
     add_page_context("Status cards", "; ".join(card_details))
-    
-    # Determine trend emoji and color
-    trend_indicator = ""
-    trend_color = "#28A745"  # Green
+
+    # Trend in a neutral colour: a rise is not "good" for every reading (e.g. pressure).
+    trend_html = ""
     if trend is not None:
-        if trend > 0:
-            trend_indicator = f"📈 +{trend:.1f}%"
-            trend_color = "#28A745"  # Green
-        elif trend < 0:
-            trend_indicator = f"📉 {trend:.1f}%"
-            trend_color = "#DC3545"  # Red
-    
-    # Create custom HTML for the card using st.container
+        arrow = "arrow_up" if trend > 0.05 else "arrow_down" if trend < -0.05 else "minus"
+        trend_html = (
+            "<div style='display:flex; align-items:center; gap:4px; margin-top:8px; font-size:12px; opacity:0.75;'>"
+            f"{card_icon_svg(arrow, 'currentColor', size=13, stroke=2.4)}"
+            f"<span style='font-weight:600;'>{trend:+.1f}%</span>"
+            "<span style='opacity:0.8;'>vs last 10 readings</span></div>"
+        )
+    range_html = (
+        f"<div style='margin-top:6px; font-size:11px; opacity:0.55;'>Typical {min_val:,.0f} – {max_val:,.0f} {unit}</div>"
+        if min_val is not None and max_val is not None else ""
+    )
+    if note:
+        range_html += f"<div style='margin-top:8px; font-size:12px; opacity:0.6;'>{note}</div>"
+    card_html = (
+        "<div style='display:flex; justify-content:space-between; align-items:flex-start; gap:12px;'>"
+        "<div style='min-width:0;'>"
+        f"<div style='font-size:11px; font-weight:600; letter-spacing:0.06em; text-transform:uppercase; opacity:0.65;'>{label}</div>"
+        "<div style='display:flex; align-items:baseline; gap:6px; margin-top:10px;'>"
+        f"<span style='font-size:28px; font-weight:700; line-height:1; font-variant-numeric:tabular-nums;'>{formatted_value}</span>"
+        f"<span style='font-size:13px; font-weight:500; opacity:0.6;'>{unit}</span></div>"
+        f"{trend_html}{range_html}</div>"
+        f"<div style='flex:none; width:42px; height:42px; border-radius:10px; background:{color}22; "
+        f"display:flex; align-items:center; justify-content:center;'>{card_icon_svg(icon, color)}</div>"
+        "</div>"
+    )
     with st.container(border=True, height=150):
-        col_content, col_icon = st.columns([5, 1])
-        
-        with col_content:
-            st.markdown(f"<p style='font-size: 11px; color: #666; text-transform: uppercase; font-weight: 600; margin: 0;'>{label}</p>", unsafe_allow_html=True)
-            
-            st.markdown(f"""
-            <div style='display: flex; align-items: baseline; margin: 10px 0 0 0;'>
-                <h2 style='margin: 0; font-size: 28px; font-weight: 700; color: {color};'>{formatted_value}</h2>
-                <span style='margin-left: 8px; font-size: 14px; color: #666; font-weight: 500;'>{unit}</span>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            if trend_indicator:
-                st.markdown(f"<p style='margin: 8px 0 0 0; font-size: 12px; color: {trend_color}; font-weight: 600;'>{trend_indicator}</p>", unsafe_allow_html=True)
-            
-            if min_val is not None and max_val is not None:
-                st.markdown(f"<p style='margin: 8px 0 0 0; font-size: 10px; color: #999;'>Range: {min_val:.1f} - {max_val:.1f} {unit}</p>", unsafe_allow_html=True)
-        
-        with col_icon:
-            st.markdown(f"<p style='font-size: 36px; margin: 0; text-align: center;'>{icon}</p>", unsafe_allow_html=True)
+        st.markdown(card_html, unsafe_allow_html=True)
 
 
 # Normal ranges from docs/knowledge_base/co2_injection_thresholds.md (sections 2-5).
@@ -451,7 +486,51 @@ def twin_flow_animation(flow_bpm):
     )
 
 
+# The digital twin is drawn by a small custom component (v2, no iframe) so its two reading boxes can be clicked:
+# a click sends the box name ("surface" or "bottom") back to Python, which opens the trend dialog.
+_DIGITAL_TWIN_COMPONENT = st.components.v2.component(
+    "digital_twin_schematic",
+    html="""<div id="twin-root"></div>""",
+    js="""
+export default function (component) {
+  const { data, parentElement, setTriggerValue } = component
+  const root = parentElement.querySelector("#twin-root")
+  if (!root) return
+  const html = (data && data.html) || ""
+  if (root.__twinHtml !== html) {
+    root.innerHTML = html
+    root.__twinHtml = html
+  }
+  root.querySelectorAll("[data-twin-box]").forEach((box) => {
+    const open = () => setTriggerValue("clicked", box.dataset.twinBox)
+    box.onclick = open
+    box.onkeydown = (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault()
+        open()
+      }
+    }
+  })
+}
+""",
+)
+
+
+def digital_twin_component(markup):
+    """Mount the twin; returns "surface" or "bottom" on the run after a box is clicked, otherwise None."""
+    result = _DIGITAL_TWIN_COMPONENT(data={"html": markup}, key="digital_twin", on_clicked_change=lambda: None)
+    return getattr(result, "clicked", None)
+
+
+# Pressures shown on the twin follow docs/knowledge_base/co2_injection_thresholds.md: estimated injection-zone fracture
+# pressure ~2,445 psi (design basis), and the maximum allowable CBHP 2,200 psi = 90% of it (US EPA Class VI rule).
+# The other formation values on the schematic (depths, porosity, permeability, salinity) are illustrative only.
+TWIN_FRACTURE_PRESSURE_PSI = 2445
+TWIN_CBHP_LIMIT_PSI = 2200
+
+
 def render_digital_twin(current_data: dict):
+    """Draw the well schematic; returns the reading box the user clicked ("surface", "bottom" or "flow"), or None."""
     def display_value(value, unit="", decimals=0):
         if value is None or pd.isna(value):
             return "N/A"
@@ -488,11 +567,13 @@ def render_digital_twin(current_data: dict):
         f"flow (flowrate meter) {flow};hydrostatic head +1,582 PSI; fluid: supercritical CO2. "
         "Box colours: green = both readings normal, orange = one normal, red = neither normal. "
         f"P_surf/T_surf box: {surface_label} ({TWIN_STATUS_STYLES[surface_state][3]}; {surface_ranges}). "
-        f"BHP/BHT box: {bottom_label} ({TWIN_STATUS_STYLES[bottom_state][3]}; {bottom_ranges}).",
+        f"BHP/BHT box: {bottom_label} ({TWIN_STATUS_STYLES[bottom_state][3]}; {bottom_ranges}). "
+        "The formation properties on the schematic (caprock depth, porosity, permeability, salinity) are illustrative "
+        f"values, not measured in the dataset. Design-basis injection-zone fracture pressure ~{TWIN_FRACTURE_PRESSURE_PSI:,} psi; "
+        f"maximum allowable CBHP {TWIN_CBHP_LIMIT_PSI:,} psi (90% of fracture pressure), from the knowledge base.",
     )
 
-    st.markdown(
-        f"""
+    markup = f"""
         <style>
         .digital-twin {{
             position: relative; overflow: hidden; min-height: 430px; margin: .35rem 0 1.25rem;
@@ -510,15 +591,17 @@ def render_digital_twin(current_data: dict):
         .twin-title {{ color: #edf4ff; font: 700 1.05rem 'IBM Plex Sans', sans-serif; }}
         .twin-title span {{ color: #15d6c9; }}
         .twin-flow {{ padding: .42rem .75rem; border: 1px solid #233c59; border-radius: 6px; color: #a9c8ef; background: #0c1930; font-size: .78rem; }}
-        .twin-stage {{ height: 325px; margin: 0 1.25rem; position: relative; }}
+        .twin-stage {{ height: 420px; margin: 0 1.25rem; position: relative; }}
         .twin-surface-line {{ position: absolute; top: 49px; left: 18%; right: 20%; height: 5px; border-radius: 5px; background: #596b86; box-shadow: 0 0 0 1px #263b56; }}
         .twin-label {{ position: absolute; color: #7b9abc; font-size: .68rem; letter-spacing: .03em; }}
         .twin-surface {{ top: 30px; left: 18%; }}
         .twin-formations {{ position: absolute; top: 51px; bottom: 0; left: 20%; width: 60%; background: rgba(25, 35, 60, .7); }}
+        /* Padding inside the % heights; text kept in the column left of the wellbore (the well sits ~47% across). */
+        .twin-formations > div {{ box-sizing: border-box; overflow: hidden; padding-right: 55% !important; }}
         .twin-overburden {{ height: 36%; padding: 1.6rem .7rem; color: #637da4; font-size: .7rem; }}
         .twin-caprock {{ height: 22%; padding: .9rem .7rem; border-top: 1px dashed #bfc9d8; border-bottom: 1px dashed #bfc9d8; background: rgba(82, 99, 126, .62); color: #f1f4fc; font-size: .7rem; }}
         .twin-caprock b, .twin-target b {{ display: block; margin-bottom: .35rem; color: #f7fbff; }}
-        .twin-target {{ height: 42%; padding: 1.15rem .7rem; background: rgba(0, 70, 78, .75); color: #98f8ed; font-size: .7rem; }}
+        .twin-target {{ height: 42%; padding: .9rem .7rem; background: rgba(0, 70, 78, .75); color: #98f8ed; font-size: .7rem; line-height: 1.6; }}
         .twin-well {{ position: absolute; top: 18px; bottom: -4px; left: 48%; width: 42px; border-left: 4px solid #97a7be; border-right: 4px solid #97a7be; background: linear-gradient(90deg, #07867f, #12b9a9 48%, #087d78); box-shadow: 0 0 18px rgba(11, 214, 194, .2); }}
         .twin-well::before {{ content: ''; position: absolute; top: -2px; left: -18px; width: 70px; height: 31px; border: 2px solid #8293aa; border-radius: 4px; background: #4b5c73; }}
         .twin-well::after {{ content: ''; position: absolute; top: -11px; left: 12px; width: 14px; height: 14px; border-radius: 50%; background: #10b9ad; }}
@@ -528,11 +611,18 @@ def render_digital_twin(current_data: dict):
         .twin-callout {{ position: absolute; padding: .55rem .65rem; border: 1px solid #10d5ce; border-radius: 6px; background: #062b31; color: #75fff4; font-size: .68rem; line-height: 1.45; }}
         .twin-surface-callout {{ top: 25px; left: 56%; }}
         .twin-status {{ display: block; margin-top: .2rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }}
+        [data-twin-box] {{ cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; }}
+        .twin-flow-hint {{ margin-left: .3rem; opacity: .7; }}
+        [data-twin-box]:hover, [data-twin-box]:focus-visible {{
+            transform: translateY(-1px); box-shadow: 0 0 0 2px rgba(117, 255, 244, .35), 0 6px 16px rgba(0, 0, 0, .35); outline: none;
+        }}
+        .twin-hint {{ display: block; margin-top: .25rem; font-size: .6rem; opacity: .7; letter-spacing: .02em; }}
         .twin-bottom-callout {{ right: 14%; bottom: 8px; }}
         .twin-annulus {{ top: 111px; left: 23%; color: #f0a62b; }}
         .twin-annulus::before {{ content: ''; position: absolute; top: 50%; right: -45px; width: 42px; border-top: 2px dotted #f0a62b; }}
         .twin-footer {{ display: flex; justify-content: space-between; margin: 0 1.25rem; padding: .8rem .35rem 1rem; border-top: 1px solid #1d3046; color: #b4c5db; font: .9rem 'IBM Plex Sans', sans-serif; }}
         .twin-footer strong {{ color: #14d5ca; }}
+        .twin-note {{ position: relative; z-index: 1; margin: -.4rem 1.25rem 0; padding: 0 .35rem .9rem; color: #7b9abc; font-size: .68rem; }}
         @media (max-width: 700px) {{
             .twin-header {{ align-items: flex-start; gap: .7rem; flex-direction: column; }}
             .twin-stage {{ margin: 0 .5rem; }} .twin-formations {{ left: 8%; width: 84%; }}
@@ -544,25 +634,185 @@ def render_digital_twin(current_data: dict):
         <div class="digital-twin">
             <div class="twin-header">
                 <div class="twin-title"><span>◉</span>&nbsp; Subsurface profile <span>(TVD: 7,450 ft)</span></div>
-                <div class="twin-flow">Flow: {flow}</div>
+                <div class="twin-flow" data-twin-box="flow" role="button" tabindex="0" aria-label="Show flow rate history" title="Click for flow-rate trend">Flow: {flow} <span class="twin-flow-hint">↗</span></div>
             </div>
             <div class="twin-stage">
                 <div class="twin-surface-line"></div><div class="twin-label twin-surface">SURFACE&nbsp; (0 ft)</div>
                 <div class="twin-formations">
                     <div class="twin-overburden">Overburden Shales &amp; Sands</div>
-                    <div class="twin-caprock"><b>PRIMARY CAPROCK SEAL (Eau Claire Shale)</b>Depth: 6,800 - 7,100 ft · P_break: 4,180 PSI</div>
-                    <div class="twin-target"><b>TARGET SALINE FORMATION (Mount Simon Sandstone)</b>Porosity: 18.4% · Perm: 145 mD · Salinity: 120,000 ppm</div>
+                    <div class="twin-caprock"><b>PRIMARY CAPROCK SEAL</b>Depth*: 6,800 - 7,100 ft</div>
+                    <div class="twin-target"><b>TARGET SALINE FORMATION</b>Porosity*: 18.4% · Perm*: 145 mD<br>Salinity*: 120,000 ppm<br>CBHP limit: {TWIN_CBHP_LIMIT_PSI:,} PSI</div>
                 </div>
                 <div class="twin-well"><span class="twin-sensor sensor-one"></span><span class="twin-sensor sensor-two"></span><span class="twin-sensor sensor-three"></span></div>
                 <div class="twin-label twin-annulus">A-Annulus: {annulus_psi}</div>
-                <div class="twin-callout twin-surface-callout" title="{surface_ranges}" style="{twin_callout_style(surface_state)}">P_surf: <b>{surface_psi}</b><br>T_surf: {surface_temp}<span class="twin-status">● {surface_label}</span></div>
-                <div class="twin-callout twin-bottom-callout" title="{bottom_ranges}" style="{twin_callout_style(bottom_state)}">BHP: <b>{bottom_pressure}</b><br>BHT: {bottom_temperature}<span class="twin-status">● {bottom_label}</span></div>
+                <div class="twin-callout twin-surface-callout" data-twin-box="surface" role="button" tabindex="0" aria-label="Show surface pressure and temperature history" title="{surface_ranges}" style="{twin_callout_style(surface_state)}">P_surf: <b>{surface_psi}</b><br>T_surf: {surface_temp}<span class="twin-status">● {surface_label}</span><span class="twin-hint">Click for trend ↗</span></div>
+                <div class="twin-callout twin-bottom-callout" data-twin-box="bottom" role="button" tabindex="0" aria-label="Show bottom-hole pressure and temperature history" title="{bottom_ranges}" style="{twin_callout_style(bottom_state)}">BHP: <b>{bottom_pressure}</b><br>BHT: {bottom_temperature}<span class="twin-status">● {bottom_label}</span><span class="twin-hint">Click for trend ↗</span></div>
             </div>
-            <div class="twin-footer"><span>Hydrostatic Head: <strong>+1,582 PSI</strong></span><span>Fluid: <strong>Supercritical CO₂</strong></span></div>
+            <div class="twin-footer"><span>Fluid: <strong>Supercritical CO₂</strong></span></div>
+            <div class="twin-note">* Illustrative formation values, not from the dataset.</div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """
+    return digital_twin_component(markup)
+
+
+# CO2 critical point: above both values CO2 is supercritical (dense like a liquid, flows like a gas).
+CO2_CRITICAL_PRESSURE_PSI = 1071.0
+CO2_CRITICAL_TEMPERATURE_F = 87.98
+
+# Trend dialog opened by clicking a reading box on the digital twin.
+TWIN_TREND_SPECS = {
+    "surface": {
+        "title": "Surface conditions",
+        "endpoint": "/api/dashboard/subset-flow", "rows_key": "data", "time": "date_time",
+        "series": [
+            {"column": "surface_psi", "label": "Surface pressure", "unit": "PSI", "normal": SURFACE_PRESSURE_NORMAL_PSI, "critical": 1600},
+            {"column": "surface_temperature", "label": "Surface temperature", "unit": "°F", "normal": SURFACE_TEMPERATURE_NORMAL_F, "critical": None},
+        ],
+    },
+    "flow": {
+        "title": "Injection flow rate",
+        "endpoint": "/api/dashboard/subset-flow", "rows_key": "data", "time": "date_time",
+        # Knowledge base: normal 1.0-4.9 BPM while injecting, design maximum 5.0 BPM.
+        "series": [
+            {"column": "flow_bpm", "label": "Flow rate", "unit": "BPM", "normal": (1.0, 4.9), "critical": 5.0},
+        ],
+    },
+    "bottom": {
+        "title": "Bottom-hole conditions",
+        "endpoint": "/api/dashboard/metrics", "rows_key": "timeseries", "time": "timestamp",
+        "series": [
+            {"column": "corrected_bottom_hole_pressure", "label": "Corrected bottom-hole pressure", "unit": "PSI", "normal": BOTTOM_PRESSURE_NORMAL_PSI, "critical": 2200, "supercritical": CO2_CRITICAL_PRESSURE_PSI},
+            {"column": "bht", "label": "Bottom-hole temperature", "unit": "°F", "normal": BOTTOM_TEMPERATURE_NORMAL_F, "critical": 125, "supercritical": CO2_CRITICAL_TEMPERATURE_F},
+        ],
+    },
+}
+TWIN_TREND_WINDOWS = {"Last 1 h": 1, "Last 6 h": 6, "Last 24 h": 24, "All": None}
+TWIN_GAP = pd.Timedelta(minutes=10)
+
+
+def close_twin_trend():
+    st.session_state.pop("twin_trend_box", None)
+
+
+@st.cache_data(show_spinner=False)
+def twin_trend_rows(endpoint, rows_key, start, end):
+    """The whole recorded history for a dialog (historical data, so it is fetched once and cached)."""
+    response = api_get(endpoint, params={"start": start, "end": end}, timeout=60)
+    if not response:  # raise so a failed request is not cached
+        raise RuntimeError(f"No response from {endpoint}")
+    return pd.DataFrame(response.get(rows_key, []))
+
+
+def twin_trend_history(spec, end_time):
+    """Readings up to the simulated time, with a blank row at each logging gap so lines are not drawn across it."""
+    start, end = get_excel_date_range()
+    if not start:
+        return pd.DataFrame()
+    try:
+        df = twin_trend_rows(spec["endpoint"], spec["rows_key"], f"{start}T00:00:00", query_end_timestamp(end)).copy()
+    except RuntimeError:
+        return pd.DataFrame()
+    columns = [series["column"] for series in spec["series"]]
+    if df.empty or spec["time"] not in df or not set(columns) <= set(df.columns):
+        return pd.DataFrame()
+    df = df[[spec["time"], *columns]].rename(columns={spec["time"]: "time"})
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df[columns] = df[columns].apply(pd.to_numeric, errors="coerce")
+    df = df.dropna(subset=["time"]).sort_values("time")
+    if end_time is not None:
+        df = df[df["time"] <= pd.Timestamp(end_time)]
+    gaps = df.loc[df["time"].diff() > TWIN_GAP, ["time"]]
+    if not gaps.empty:
+        breaks = gaps.assign(time=gaps["time"] - pd.Timedelta(seconds=1))
+        df = pd.concat([df, breaks]).sort_values("time", kind="stable")
+    return df.reset_index(drop=True)
+
+
+def twin_trend_chart(df, series, color):
+    """One reading over time, normal range shaded and the critical level marked."""
+    low, high = series["normal"]
+    fig = go.Figure(go.Scattergl(
+        x=df["time"], y=df[series["column"]], mode="lines", connectgaps=False, line=dict(color=color, width=1.6),
+        hovertemplate=f"%{{x|%d %b %H:%M}}<br>%{{y:,.1f}} {series['unit']}<extra></extra>",
+    ))
+    fig.add_hrect(y0=low, y1=high, fillcolor=color, opacity=0.07, line_width=0)
+    if series["critical"] is not None:
+        fig.add_hline(y=series["critical"], line_dash="dash", line_color=BRAND_RED, line_width=1,
+                      annotation_text=f"Critical {series['critical']:,.0f} {series['unit']}",
+                      annotation_position="top left", annotation_font=dict(size=11, color=BRAND_RED))
+    supercritical = series.get("supercritical")
+    if supercritical is not None:
+        fig.add_hline(y=supercritical, line_dash="dash", line_color=BRAND_GREEN, line_width=1.4,
+                      annotation_text=f"Supercritical CO₂ above {supercritical:,.2f}".rstrip("0").rstrip(".") + f" {series['unit']}",
+                      annotation_position="bottom left", annotation_font=dict(size=11, color=BRAND_GREEN))
+    # Fit the axis to the readings and the reference lines, not the whole normal band, so changes stay visible.
+    values = df[series["column"]].dropna()
+    if not values.empty:
+        span_low = min(float(values.min()), supercritical if supercritical is not None else float(values.min()))
+        span_high = max(float(values.max()), series["critical"] or float(values.max()))
+        padding = (span_high - span_low) * 0.08 or 1.0
+        fig.update_yaxes(range=[span_low - padding, span_high + padding])
+    fig.update_layout(title_text=f"{series['label']} ({series['unit']}) · shaded band = normal range", showlegend=False)
+    return style_prediction_figure(fig, height=260)
+
+
+def render_twin_trend(box, end_time):
+    spec = TWIN_TREND_SPECS[box]
+    df = twin_trend_history(spec, end_time)
+    if df.empty:
+        st.info("No readings are available up to the simulated time.", icon=":material/info:")
+        return
+    window = st.segmented_control("Time window", list(TWIN_TREND_WINDOWS), default="Last 6 h", key=f"twin_window_{box}")
+    hours = TWIN_TREND_WINDOWS.get(window or "Last 6 h")
+    shown = df if hours is None else df[df["time"] >= df["time"].max() - pd.Timedelta(hours=hours)]
+    latest = df.dropna(subset=[s["column"] for s in spec["series"]], how="all").iloc[-1]
+    metric_cols = st.columns(len(spec["series"]))
+    for column, series in zip(metric_cols, spec["series"]):
+        value = latest[series["column"]]
+        low, high = series["normal"]
+        show_metric(column, f"{series['label']} · {latest['time']:%d %b %H:%M}",
+                    "N/A" if pd.isna(value) else f"{value:,.1f} {series['unit']}",
+                    help=f"Normal {low:,.0f}–{high:,.0f} {series['unit']}", border=True)
+    if box == "flow":
+        st.caption("History of the Flow BPM channel (used by the models). The badge on the twin shows the flowrate "
+                   "meter, so the two can differ slightly. Below 1.0 BPM the well is treated as not injecting.")
+    if box == "bottom":
+        pressure, temperature = latest["corrected_bottom_hole_pressure"], latest["bht"]
+        if pd.isna(pressure) or pd.isna(temperature):
+            st.badge("Phase unknown: reading missing", color="gray", icon=":material/help:")
+        elif pressure > CO2_CRITICAL_PRESSURE_PSI and temperature > CO2_CRITICAL_TEMPERATURE_F:
+            st.badge("Supercritical CO₂ at the bottom of the well", color="green", icon=":material/check_circle:")
+        else:
+            below = [name for name, value, limit in [("pressure", pressure, CO2_CRITICAL_PRESSURE_PSI),
+                                                     ("temperature", temperature, CO2_CRITICAL_TEMPERATURE_F)] if value <= limit]
+            st.badge(f"Not supercritical: {' and '.join(below)} below the critical point", color="orange", icon=":material/warning:")
+        st.caption(f"Supercritical when CBHP is above {CO2_CRITICAL_PRESSURE_PSI:,.0f} psi **and** BHT is above "
+                   f"{CO2_CRITICAL_TEMPERATURE_F} °F (CO₂ critical point).")
+    if shown[[s["column"] for s in spec["series"]]].dropna(how="all").empty:
+        st.caption("The instruments were not recording in this window. Choose a longer window.")
+    # Theme blue for pressure, theme orange for temperature (brighter variants in dark mode).
+    colors = ["#5C7FE0", "#F0904A"] if DARK_MODE else ["#20419A", "#E87722"]
+    for series, color in zip(spec["series"], colors):
+        show_chart(twin_trend_chart(shown, series, color), key=f"twin_chart_{box}_{series['column']}")
+    st.caption("Gaps are periods when the instruments were not recording. Close this window to resume live updates.")
+
+
+@st.dialog("Surface conditions over time", width="large", icon=":material/show_chart:", on_dismiss=close_twin_trend)
+def surface_trend_dialog(end_time):
+    render_twin_trend("surface", end_time)
+
+
+@st.dialog("Bottom-hole conditions over time", width="large", icon=":material/show_chart:", on_dismiss=close_twin_trend)
+def bottom_trend_dialog(end_time):
+    render_twin_trend("bottom", end_time)
+
+
+@st.dialog("Injection flow rate over time", width="large", icon=":material/show_chart:", on_dismiss=close_twin_trend)
+def flow_trend_dialog(end_time):
+    render_twin_trend("flow", end_time)
+
+
+TWIN_TREND_DIALOGS = {"surface": surface_trend_dialog, "bottom": bottom_trend_dialog, "flow": flow_trend_dialog}
 
 
 def render_daily_injection_charts(start: str, end: str):
@@ -628,11 +878,6 @@ def render_daily_injection_charts(start: str, end: str):
             hovermode="x unified",
         )
         show_chart(cumulative_fig)
-
-
-def toggle_flow_unit():
-    current_unit = st.session_state.get("flow_unit", "flow_bpm")
-    st.session_state["flow_unit"] = "flow_gpm" if current_unit == "flow_bpm" else "flow_bpm"
 
 
 @st.cache_data(show_spinner=False)
@@ -1730,11 +1975,11 @@ def render_live_monitoring(simulated_time=None):
     current_data = get_current_data(timestamp=simulated_time)
     if current_data:
         update_time = current_data["timestamp"].strftime("%d/%m/%Y %I:%M:%S %p")
-        st.info(f"📊 Dashboard updated at {update_time}")
+        st.info(f"Dashboard updated at {update_time}", icon=":material/schedule:")
         st.subheader("Current Status")
 
         try:
-            df = pd.read_excel("data/excel/combined_co2_data_only_file.xls", sheet_name="Dataset_Test", engine="xlrd")
+            df = excel_sheet().copy()
             df["Date & Time"] = pd.to_datetime(df["Date & Time"])
             df = df[df["Date & Time"] <= current_data["timestamp"]]
             current_idx = len(df) - 1
@@ -1748,27 +1993,41 @@ def render_live_monitoring(simulated_time=None):
                 trend_annulus = ((current_data["annulus_psi"] - prev_avg_annulus) / prev_avg_annulus * 100) if prev_avg_annulus else 0
             else:
                 trend_temp = trend_psi = trend_annulus = 0
-            temp_min, temp_max = df["Surface Temp."].min(), df["Surface Temp."].max()
-            psi_min, psi_max = df["Surface PSI"].min(), df["Surface PSI"].max()
-            annulus_min, annulus_max = df["Annulus PSI"].min(), df["Annulus PSI"].max()
+            # Typical range = 1st to 99th percentile, so sensor glitches (e.g. the 10,313 psi annulus spike or
+            # -36 °F surface temperature) do not stretch the range shown on the card.
+            def typical_range(column):
+                values = pd.to_numeric(df[column], errors="coerce").dropna()
+                return (float(values.quantile(0.01)), float(values.quantile(0.99))) if not values.empty else (None, None)
+
+            temp_min, temp_max = typical_range("Surface Temp.")
+            psi_min, psi_max = typical_range("Surface PSI")
+            annulus_min, annulus_max = typical_range("Annulus PSI")
             total_injected_volume = pd.to_numeric(df["Flow BPM"], errors="coerce").fillna(0).sum() * (10 / 60)
         except Exception:
             trend_temp = trend_psi = trend_annulus = 0
-            temp_min = temp_max = psi_min = psi_max = annulus_min = annulus_max = 0
+            temp_min = temp_max = psi_min = psi_max = annulus_min = annulus_max = None
             total_injected_volume = 0
 
+        # Accent colours from the PETRONAS palette in .streamlit/config.toml (mid tones readable in light and dark).
         card_col1, card_col2, card_col3, card_col4 = st.columns(4)
         with card_col1:
-            metric_card("Surface Temperature", current_data["surface_temp"] or 0, "°F", "#FF6B6B", "🌡️", trend=trend_temp, min_val=temp_min, max_val=temp_max)
+            metric_card("Surface Temperature", current_data["surface_temp"] or 0, "°F", "#E87722", "thermometer", trend=trend_temp, min_val=temp_min, max_val=temp_max)
         with card_col2:
-            metric_card("Surface Pressure", current_data["surface_psi"] or 0, "PSI", "#0078D4", "📊", trend=trend_psi, min_val=psi_min, max_val=psi_max)
+            metric_card("Surface Pressure", current_data["surface_psi"] or 0, "PSI", "#3F6AD8", "gauge", trend=trend_psi, min_val=psi_min, max_val=psi_max)
         with card_col3:
-            metric_card("Annulus Pressure", current_data["annulus_psi"] or 0, "PSI", "#20C997", "⚙️", trend=trend_annulus, min_val=annulus_min, max_val=annulus_max)
+            metric_card("Annulus Pressure", current_data["annulus_psi"] or 0, "PSI", "#8E5BB5", "annulus", trend=trend_annulus, min_val=annulus_min, max_val=annulus_max)
         with card_col4:
-            metric_card("Total Injected Volume", total_injected_volume, "bbl", "#15D6C9", "💧")
+            metric_card("Total Injected Volume", total_injected_volume, "bbl", "#00A19C", "droplets",
+                        note="Cumulative since recording began (flow rate × time)")
 
     st.subheader("Analytics")
-    render_digital_twin(current_data or {})
+    clicked_box = render_digital_twin(current_data or {})
+    if clicked_box in TWIN_TREND_DIALOGS:
+        st.session_state["twin_trend_box"] = clicked_box
+    # Re-open on every full run while it is open (a full rerun would otherwise close it); cleared on dismiss.
+    open_box = st.session_state.get("twin_trend_box")
+    if open_box in TWIN_TREND_DIALOGS:
+        TWIN_TREND_DIALOGS[open_box](simulated_time)
 
 
 @st.fragment(run_every="1s")
@@ -2318,7 +2577,8 @@ reset_page_context(
     f"Page: {page}. Data source: data/excel/combined_co2_data_only_file.xls and PostgreSQL fulldata."
     + (f" Simulated current time: {simulated_time:%Y-%m-%d %H:%M:%S} (data after this time is hidden)." if simulated_time is not None else ""),
 )
-if simulated_time is not None:
+# Live refresh pauses while a digital-twin trend dialog is open, so the refresh does not close it.
+if simulated_time is not None and not st.session_state.get("twin_trend_box"):
     st_autorefresh(interval=DATA_REFRESH_INTERVAL_MS, key="dashboard_refresh")
 context_col, refresh_col = st.columns([4, 1])
 with context_col:
@@ -2340,58 +2600,8 @@ if page == "Overview":
 
     subset_start, subset_end = get_excel_date_range(end_timestamp=simulated_time)
     if subset_start and subset_end:
+        # Flow rate, surface pressure and surface temperature history are shown by clicking the digital twin.
         render_daily_injection_charts(subset_start, subset_end)
-
-        if "flow_unit" not in st.session_state:
-            st.session_state["flow_unit"] = "flow_bpm"
-        st.button(
-            "Switch to GPM" if st.session_state["flow_unit"] == "flow_bpm" else "Switch to BPM",
-            key="flow_unit_toggle",
-            on_click=toggle_flow_unit,
-        )
-
-        with st.spinner("Loading flow data..."):
-            subset_response = api_get(
-                "/api/dashboard/subset-flow",
-                params={
-                    "start": f"{subset_start}T00:00:00",
-                    "end": query_end_timestamp(subset_end),
-                },
-                timeout=30,
-            )
-        subset_df = pd.DataFrame((subset_response or {}).get("data", []))
-        if not subset_df.empty:
-            subset_df["date_time"] = pd.to_datetime(subset_df["date_time"])
-            flow_unit = st.session_state["flow_unit"]
-            flow_label = "Flow (GPM)" if flow_unit == "flow_gpm" else "Flow (BPM)"
-            flow_fig = px.line(
-                subset_df,
-                x="date_time",
-                y=flow_unit,
-                title=f"Flow Rate (Subset Data) - {flow_label.split('(')[-1].rstrip(')')}",
-                labels={"date_time": "Date and time", flow_unit: flow_label},
-            )
-            show_chart(flow_fig)
-
-            surface_psi_fig = px.line(
-                subset_df,
-                x="date_time",
-                y="surface_psi",
-                title="Surface Pressure (Subset Data)",
-                labels={"date_time": "Date and time", "surface_psi": "Surface PSI"},
-            )
-            show_chart(surface_psi_fig)
-
-            surface_temperature_fig = px.line(
-                subset_df,
-                x="date_time",
-                y="surface_temperature",
-                title="Surface Temperature (Subset Data)",
-                labels={"date_time": "Date and time", "surface_temperature": "Surface Temperature"},
-            )
-            show_chart(surface_temperature_fig)
-        else:
-            st.info("No subset flow data is available for this period.")
     
     # Only load metrics on demand with a button
     if st.button("Load Detailed Metrics"):
@@ -2644,16 +2854,16 @@ elif page == "Injection Optimization Simulator":
                 key="optimizer_flow_max",
                 help="The search is capped at the highest flow in the data (5.0 BPM); the models cannot predict reliably beyond it.",
             )
-            flow_step = st.number_input("Search step (BPM)", min_value=0.01, value=1.0, key="optimizer_flow_step")
+            flow_step = st.number_input("Search step (BPM)", min_value=0.01, value=0.10, step=0.01, format="%.2f", key="optimizer_flow_step")
 
     with st.container(border=True):
         st.subheader("Safety target")
         target_col, action_col = st.columns([1, 2])
         with target_col:
             if mode == "maximum_injection":
-                limit = st.number_input("Maximum allowable CBHP (psi)", value=2200.0, key="optimizer_cbhp_limit_maximum")
+                limit = st.number_input("Maximum allowable CBHP (psi)", value=1850.0, key="optimizer_cbhp_limit_maximum")
             elif mode == "safe_operation":
-                limit = st.number_input("Maximum allowable CBHP (psi)", value=2200.0, key="optimizer_cbhp_limit_safe")
+                limit = st.number_input("Maximum allowable CBHP (psi)", value=1850.0, key="optimizer_cbhp_limit_safe")
                 safety_margin_pct = st.number_input(
                     "Target safety margin (%)",
                     min_value=0.0,

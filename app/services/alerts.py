@@ -20,6 +20,7 @@ CATEGORIES = {
     "limit": "Operating limit",
     "rate": "Rate of change",
     "model": "Model mismatch",
+    "drift": "Gradual drift",
 }
 
 # Operating limits (knowledge base sections 2-8). Low limits on the injection readings only apply while
@@ -82,11 +83,27 @@ MODEL_SMOOTHING = "3min"
 MODEL_AFTER_INJECTING_MINUTES = 60
 MODEL_CRITICAL_BANDS = 2.0
 
+# Gradual drift: a two-sided CUSUM (cumulative sum) on the same model gap. The model check only fires once
+# the gap passes the error band; CUSUM adds up small persistent changes, so a slow drift is found before it
+# gets that large. In each steady-injection stretch the gap's baseline is its median over the first
+# DRIFT_BASELINE_MINUTES (this absorbs a constant model bias for that period). After that, every minute the
+# gap differs from the baseline by more than the allowance k (DRIFT_K_BANDS x band) adds the excess to the
+# sum; an alert is raised when the sum passes h (DRIFT_H_BAND_MINUTES x band, in unit-minutes). For a steady
+# offset d > k this takes h / (d - k) minutes, e.g. CBHP (k = 36 psi, h = 240 psi-min): a 48 psi offset after
+# ~20 min. k and h were chosen with scripts/evaluate_alerts.py --grid: with k = 0.25x band the drift alert was
+# on for 24 of the 37 gauge-hours of clean steady injection (the model gap wanders by up to one band over
+# hours); k = 0.75x, h = 5x keeps it to 0.5 h while catching 50% of 0.25x-band-per-hour CBHP drifts (13% without
+# the drift check) and 97% of 1x-band-per-hour BHT drifts.
+DRIFT_SMOOTHING = "1min"
+DRIFT_BASELINE_MINUTES = 30.0
+DRIFT_K_BANDS = 0.75
+DRIFT_H_BAND_MINUTES = 5.0
+
 # Grouping: flagged readings less than MERGE_MINUTES apart (by category) form one event, so a reading
 # hovering around a limit raises one alert, not one per crossing; an event must last MIN_MINUTES before
 # it is raised, so single noisy readings do not alarm.
-MERGE_MINUTES = {"sensor": 2.0, "limit": 10.0, "rate": 10.0, "model": 5.0}
-MIN_MINUTES = {"sensor": 0.0, "limit": 1.0, "rate": 1.0, "model": 2.0}
+MERGE_MINUTES = {"sensor": 2.0, "limit": 10.0, "rate": 10.0, "model": 5.0, "drift": 10.0}
+MIN_MINUTES = {"sensor": 0.0, "limit": 1.0, "rate": 1.0, "model": 2.0, "drift": 1.0}
 # An event is "active" if its last flagged reading is this close to the latest reading.
 ACTIVE_WITHIN_MINUTES = 2.0
 
@@ -109,6 +126,56 @@ def _minutes_unchanged(frame: pd.DataFrame, column: str) -> pd.Series:
     return (frame["timestamp"] - start).dt.total_seconds() / 60
 
 
+def _trailing_median(frame: pd.DataFrame, values: pd.Series, window: str) -> pd.Series:
+    """Trailing rolling median of ``values`` within each recording period (past readings only)."""
+    smoothed = (
+        pd.Series(values.to_numpy(dtype=float), index=pd.DatetimeIndex(frame["timestamp"]))
+        .groupby(frame["period"].to_numpy())
+        .transform(lambda s: s.rolling(window, min_periods=1).median())
+        .to_numpy()
+    )
+    return pd.Series(smoothed, index=frame.index)
+
+
+def _cusum_drift(frame: pd.DataFrame, gap: pd.Series, steady: pd.Series, valid: pd.Series, band: float):
+    """Two-sided CUSUM of ``gap`` against its baseline in each steady-injection stretch (see DRIFT_* above).
+
+    Returns ``(alarm, drift, baseline_time)``: alarm is True where either sum passes h, drift is the gap
+    minus its baseline, and baseline_time is when that stretch's baseline was set.
+    """
+    k, h = DRIFT_K_BANDS * band, DRIFT_H_BAND_MINUTES * band
+    minutes = ((frame["timestamp"] - frame["timestamp"].iloc[0]).dt.total_seconds() / 60).to_numpy()
+    stretch = ((steady != steady.shift()) | (frame["period"] != frame["period"].shift())).cumsum().to_numpy()
+    in_stretch, ok, values = steady.to_numpy(), valid.to_numpy(), gap.to_numpy(dtype=float)
+    n = len(values)
+    alarm, drift, baseline_time = np.zeros(n, dtype=bool), np.full(n, np.nan), np.full(n, np.nan)
+    current, start, last, baseline, buffer, up, down = None, 0.0, 0.0, np.nan, [], 0.0, 0.0
+    set_at = np.nan
+    for i in range(n):
+        if not in_stretch[i]:
+            current = None
+            continue
+        if stretch[i] != current:  # a new steady stretch: start a new baseline and reset the sums
+            current, start, last, baseline, buffer, up, down = stretch[i], minutes[i], minutes[i], np.nan, [], 0.0, 0.0
+        step = min(minutes[i] - last, 1.0)  # logger gaps do not count as time spent drifting
+        last = minutes[i]
+        if not ok[i] or np.isnan(values[i]):
+            continue
+        if minutes[i] - start < DRIFT_BASELINE_MINUTES:
+            buffer.append(values[i])
+            continue
+        if np.isnan(baseline):
+            baseline = float(np.median(buffer)) if buffer else values[i]
+            set_at = start + DRIFT_BASELINE_MINUTES
+        difference = values[i] - baseline
+        up = max(0.0, up + (difference - k) * step)
+        down = max(0.0, down + (-difference - k) * step)
+        alarm[i], drift[i], baseline_time[i] = up > h or down > h, difference, set_at
+    origin = frame["timestamp"].iloc[0]
+    baseline_at = pd.Series(origin + pd.to_timedelta(baseline_time, unit="min"), index=frame.index)
+    return pd.Series(alarm, index=frame.index), pd.Series(drift, index=frame.index), baseline_at
+
+
 def _flag(rows: list, rule: str, category: str, parameter: str, unit: str, severity: pd.Series, values: pd.Series,
           detail: dict[str, Any] | None = None, **extra: pd.Series) -> None:
     """Append one rule's flagged readings (severity > 0) to ``rows``."""
@@ -118,18 +185,19 @@ def _flag(rows: list, rule: str, category: str, parameter: str, unit: str, sever
     part = pd.DataFrame({"row": np.flatnonzero(hit.to_numpy()), "severity": severity[hit].astype(int).to_numpy(),
                          "value": values[hit].to_numpy(dtype=float)})
     for name, series in extra.items():
-        part[name] = series[hit].to_numpy(dtype=float)
+        part[name] = series[hit].to_numpy()
     part["rule"], part["category"], part["parameter"], part["unit"] = rule, category, parameter, unit
     part["detail"] = [detail or {}] * len(part)
     rows.append(part)
 
 
-def flag_readings(frame: pd.DataFrame, twin: dict[str, dict[str, Any]]) -> pd.DataFrame:
+def flag_readings(frame: pd.DataFrame, twin: dict[str, dict[str, Any]], drift: bool = True) -> pd.DataFrame:
     """Every flagged reading, one row per (reading, rule).
 
     ``frame`` is the prepared prediction frame (with ``annulus_glitch`` and ``<target>_missing`` flags).
     ``twin`` maps a target column to ``{"label", "unit", "predicted", "band"}``, where ``predicted`` holds
-    each reading's prediction from a model that never saw that reading's recording period.
+    each reading's prediction from a model that never saw that reading's recording period. ``drift=False``
+    leaves out the gradual-drift check (used to measure what it adds).
     """
     rows: list[pd.DataFrame] = []
     injecting = frame["flow_bpm"] > 1.0
@@ -196,17 +264,20 @@ def flag_readings(frame: pd.DataFrame, twin: dict[str, dict[str, Any]]) -> pd.Da
         if not band or predicted.isna().all():
             continue
         residual = frame[column] - predicted
-        sustained = (
-            pd.Series(residual.abs().to_numpy(), index=pd.DatetimeIndex(frame["timestamp"]))
-            .groupby(frame["period"].to_numpy())
-            .transform(lambda s: s.rolling(MODEL_SMOOTHING, min_periods=1).median())
-            .to_numpy()
-        )
-        sustained = pd.Series(sustained, index=frame.index)
+        sustained = _trailing_median(frame, residual.abs(), MODEL_SMOOTHING)
         check = steady & ~frame[f"{column}_missing"] & predicted.notna()
         severity = none.mask(check & (sustained > band), WARNING).mask(check & (sustained > MODEL_CRITICAL_BANDS * band), CRITICAL)
         _flag(rows, f"{column}_model", "model", spec["label"].capitalize(), spec["unit"], severity, frame[column],
               {"band": float(band)}, expected=predicted, residual=residual)
+
+        # 5. Gradual drift (CUSUM on the same gap).
+        if drift:
+            alarm, change, baseline_at = _cusum_drift(
+                frame, _trailing_median(frame, residual, DRIFT_SMOOTHING), steady, check, float(band)
+            )
+            _flag(rows, f"{column}_drift", "drift", spec["label"].capitalize(), spec["unit"],
+                  none.mask(alarm, WARNING), frame[column],
+                  {"band": float(band), "k": DRIFT_K_BANDS * float(band)}, drift=change, baseline_at=baseline_at)
 
     if not rows:
         return pd.DataFrame(columns=["row", "severity", "value", "rule", "category", "parameter", "unit", "detail"])
@@ -269,6 +340,22 @@ def _describe(group: pd.DataFrame, severity: int) -> tuple[str, str]:
         return (
             f"Annulus pressure changed {change:+,.0f} psi within {detail['minutes']} minutes while the flow rate was steady.",
             "Possible tubing or packer leak: compare annulus and tubing pressure and confirm well integrity.",
+        )
+    if first["category"] == "drift":
+        worst = group.loc[group["drift"].abs().idxmax()]
+        side = "above" if worst["drift"] > 0 else "below"
+        message = (
+            f"{name} has drifted {_fmt(abs(worst['drift']), unit)} {side} its usual relation to the surface readings "
+            f"(baseline set at {pd.Timestamp(first['baseline_at']):%d %b %H:%M})."
+        )
+        if abs(worst["drift"]) < detail["band"]:
+            message += (
+                f" The change built up gradually and is still within the ±{_fmt(detail['band'], unit)} model band, "
+                "so the model check would not show it yet."
+            )
+        return message, (
+            "Check the gauge calibration. If the reading is real, look for a gradual downhole change such as "
+            "near-wellbore pressure build-up, reduced injectivity or a developing leak."
         )
     worst = group.loc[group["residual"].abs().idxmax()]
     side = "above" if worst["residual"] > 0 else "below"
@@ -336,6 +423,11 @@ def rules_summary() -> list[dict[str, str]]:
             f"the model's 90% error band on unseen periods, as a {MODEL_SMOOTHING.replace('min', '-min')} median, "
             f"for {MIN_MINUTES['model']:g} min or more, after the first hour of injection. Critical beyond "
             f"{MODEL_CRITICAL_BANDS:g}× the band.")},
+        {"category": CATEGORIES["drift"], "rule": (
+            "A CUSUM (cumulative sum) of the same model gap, for slow changes that have not reached the error band. "
+            f"Its baseline is the gap's median over the first {DRIFT_BASELINE_MINUTES:g} min of each steady-injection "
+            f"stretch; every minute the gap differs from it by more than {DRIFT_K_BANDS:g}× the band adds the excess "
+            f"to the sum, and an alert is raised when the sum passes {DRIFT_H_BAND_MINUTES:g}× the band (in unit-minutes).")},
         {"category": "Grouping", "rule": (
             "Readings flagged by the same check within "
             + ", ".join(f"{minutes:g} min ({CATEGORIES[key].lower()})" for key, minutes in MERGE_MINUTES.items())
