@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import hashlib
+from functools import partial
 import io
 import json
 import numpy as np
@@ -27,7 +28,7 @@ load_dotenv()
 st.set_page_config(page_title="CCS Digital Twin", layout="wide")
 
 MONITORING_CURRENT_TIMESTAMP = "2009-09-25 03:00:01"
-DATA_REFRESH_INTERVAL_MS = 60_000
+DATA_REFRESH_INTERVAL_MS = 5 * 60_000  # automatic page refresh every 5 minutes
 
 st.title("CCS Digital Twin — Injection Monitoring")
 
@@ -1700,6 +1701,85 @@ def build_segy_chat_context(question, selected_path):
 
 
 SEGY_CLASS_COLORS = {"Clear event": "#16a34a", "Possible event": "#f59e0b", "No clear event": "#94a3b8"}
+SEGY_CLASS_BADGES = {
+    "Clear event": ("green", ":material/check_circle:", "At least 20% of channels trigger together"),
+    "Possible event": ("orange", ":material/help:", "5–20% of channels trigger together"),
+    "No clear event": ("gray", ":material/remove_circle:", "Under 5% of channels trigger together"),
+}
+
+
+def segy_overview_key(colour):
+    """Widget key of one event list. Its version number changes to clear that list's tick."""
+    return f"segy_overview_{colour}_{st.session_state.setdefault('segy_overview_versions', {}).get(colour, 0)}"
+
+
+def clear_segy_overview_ticks(keep=None):
+    """Clear the ticks in every event list except ``keep`` (a dataframe's selection cannot be set from code,
+    so the list is given a new key, which redraws it with nothing selected)."""
+    versions = st.session_state.setdefault("segy_overview_versions", {})
+    for colour, _, _ in SEGY_CLASS_BADGES.values():
+        if colour != keep:
+            versions[colour] = versions.get(colour, 0) + 1
+
+
+def select_segy_file_from_list(colour, table_key, files):
+    """Row click in an event list: load that event and well below, and untick the other lists."""
+    rows = st.session_state[table_key].selection.rows
+    if rows:
+        chosen = files.iloc[rows[0]]
+        st.session_state["segy_event"] = int(chosen["event"])
+        st.session_state["segy_well"] = chosen["well"]
+        clear_segy_overview_ticks(keep=colour)
+
+
+def render_segy_event_overview():
+    """Lists of clear, possible and unclear events across every SEGY file (STA/LTA detection)."""
+    summary = segy_event_summary()
+    if summary.empty:
+        return
+    with st.expander(f"Event detection overview · {len(summary)} SEGY files", icon=":material/radar:", expanded=True):
+        st.caption(
+            "Each file is scanned with STA/LTA (50 ms / 500 ms energy ratio, trigger ≥ 3) on every DAS channel. "
+            "A real arrival makes many channels trigger within the same 100 ms window, so files are grouped by the "
+            "share of channels that trigger together. Click a row to load that file below."
+        )
+        counts = summary["classification"].value_counts()
+        add_page_context(
+            "Event detection overview",
+            "; ".join(f"{name}: {int(counts.get(name, 0))} files" for name in SEGY_CLASS_BADGES),
+        )
+        columns = st.columns(len(SEGY_CLASS_BADGES))
+        for column, (name, (colour, icon, rule)) in zip(columns, SEGY_CLASS_BADGES.items()):
+            files = (
+                summary[summary["classification"] == name]
+                .sort_values(["coherent_share", "event"], ascending=[False, True])
+                .reset_index(drop=True)
+            )
+            table = pd.DataFrame({
+                "Event": files["event"].map(lambda value: f"Event {value}"),
+                "Well": files["well"],
+                "Coherent channels (%)": files["coherent_share"] * 100,
+            })
+            with column:
+                with st.container(horizontal=True, vertical_alignment="center"):
+                    st.badge(f"{name} · {len(files)}", color=colour, icon=icon)
+                st.caption(rule)
+                if files.empty:
+                    st.caption("No files.")
+                    continue
+                table_key = segy_overview_key(colour)
+                st.dataframe(
+                    table,
+                    hide_index=True,
+                    width="stretch",
+                    height=min(36 + 35 * len(table), 320),
+                    key=table_key,
+                    on_select=partial(select_segy_file_from_list, colour, table_key, files),
+                    selection_mode="single-row",
+                    column_config={
+                        "Coherent channels (%)": st.column_config.NumberColumn(format="%.1f%%", width="small"),
+                    },
+                )
 
 
 def build_all_segy_chat_context(question):
@@ -1971,6 +2051,58 @@ def style_segy_figure(fig, height=460):
     return fig
 
 
+# Test scenarios for the two reading boxes on the digital twin, to demonstrate each status colour on demand.
+# Values follow the knowledge-base ranges: Normal = both readings in range, Check = one out, Alert = both out.
+TWIN_SCENARIO_OPTIONS = ["Live data", "Normal", "Check", "Alert"]
+TWIN_SCENARIOS = {
+    "surface": {
+        "label": "P_surf / T_surf box",
+        "fields": ("surface_psi", "surface_temp"),
+        "values": {"Normal": (1450.0, 105.0), "Check": (1580.0, 105.0), "Alert": (1620.0, 125.0)},
+        "describe": "Surface pressure ≤ 1,550 psi and temperature 90–120 °F are normal.",
+    },
+    "bottom": {
+        "label": "BHP / BHT box",
+        "fields": ("corrected_bottom_hole_pressure", "bht"),
+        "values": {"Normal": (1850.0, 110.0), "Check": (2050.0, 110.0), "Alert": (2250.0, 80.0)},
+        "describe": "CBHP 1,071–1,980 psi and BHT 87.98–120 °F are normal.",
+    },
+}
+
+
+def reset_twin_scenarios():
+    for box in TWIN_SCENARIOS:
+        st.session_state[f"twin_scenario_{box}"] = "Live data"
+
+
+def apply_twin_scenarios(data):
+    """Show the scenario buttons and return ``data`` with the chosen boxes' readings replaced by test values."""
+    with st.expander("Test scenarios: digital twin box colours", icon=":material/science:"):
+        st.caption("Replace a box's readings with test values to see how its colour changes. "
+                   "Green = both readings normal, orange = one outside its range, red = both outside.")
+        columns = st.columns(len(TWIN_SCENARIOS))
+        for column, (box, scenario) in zip(columns, TWIN_SCENARIOS.items()):
+            with column:
+                # Initialised once instead of default=..., because "Reset to live data" sets the value from code.
+                st.session_state.setdefault(f"twin_scenario_{box}", "Live data")
+                st.segmented_control(scenario["label"], TWIN_SCENARIO_OPTIONS, key=f"twin_scenario_{box}", width="stretch")
+                st.caption(scenario["describe"])
+        st.button("Reset to live data", icon=":material/restart_alt:", on_click=reset_twin_scenarios,
+                  key="twin_scenario_reset")
+    active = []
+    for box, scenario in TWIN_SCENARIOS.items():
+        choice = st.session_state.get(f"twin_scenario_{box}") or "Live data"
+        if choice in scenario["values"]:
+            pressure_field, temperature_field = scenario["fields"]
+            data[pressure_field], data[temperature_field] = scenario["values"][choice]
+            active.append(f"{scenario['label']}: {choice}")
+    if active:
+        st.warning("Test scenario active (" + "; ".join(active) + "). The highlighted boxes show test values, "
+                   "not the live readings.", icon=":material/science:")
+        add_page_context("Test scenario", "The digital twin boxes are showing test values, not live data: " + "; ".join(active))
+    return data
+
+
 def render_live_monitoring(simulated_time=None):
     current_data = get_current_data(timestamp=simulated_time)
     if current_data:
@@ -2021,7 +2153,8 @@ def render_live_monitoring(simulated_time=None):
                         note="Cumulative since recording began (flow rate × time)")
 
     st.subheader("Analytics")
-    clicked_box = render_digital_twin(current_data or {})
+    twin_data = apply_twin_scenarios(dict(current_data or {}))
+    clicked_box = render_digital_twin(twin_data)
     if clicked_box in TWIN_TREND_DIALOGS:
         st.session_state["twin_trend_box"] = clicked_box
     # Re-open on every full run while it is open (a full rerun would otherwise close it); cleared on dismiss.
@@ -2375,10 +2508,6 @@ def render_model_performance(target_key, target_data, row_count):
             show_metric(st, "Accuracy on unseen periods (R²)", f"{holdout_r2:.3f}", border=True,
                         help="Each recording period is predicted by a model trained only on the other periods, "
                              "and R² is taken over all of those readings together (injecting readings).")
-        if best_metrics:
-            show_metric(st, "R², recent 20%", f"{best_metrics['r2']:.3f}", border=True,
-                        help="Score on the most recent 20% of readings. R² compares the error with how much the "
-                             "reading varies; when it barely changes in that window, R² is low even if the error is small.")
         if injecting_metrics:
             show_metric(st, "Average error while injecting", f"{injecting_metrics['mae']:.2f} {unit}", border=True,
                         help="Average absolute error on injecting readings in the unseen recent data.")
@@ -2401,19 +2530,12 @@ def render_model_performance(target_key, target_data, row_count):
             + f"). Including start-up readings it is {holdout_r2:.3f}: the start-up pressure jump of the first injection "
             "cannot be predicted from surface measurements."
         )
-    if best_metrics and holdout_r2 is not None and best_metrics["r2"] < 0.3 and evaluation.get("test_target_std") is not None:
-        note = (
-            f"The recent-20% R² is low because {spec['short']} barely varied in that window "
-            f"(standard deviation {evaluation['test_target_std']:.1f} {unit}), so a few large misses dominate it. "
-            "The unseen-period R² is the fairer accuracy score."
+    excluding = spikes.get("test_metrics_excluding")
+    if spikes.get("test_rows") and excluding:
+        st.caption(
+            f"{spikes['test_rows']} readings in the recent test window are unexplained spikes (shaded on the chart below); "
+            f"without them the recent average error is {excluding['mae']:.2f} {unit}."
         )
-        excluding = spikes.get("test_metrics_excluding")
-        if spikes.get("test_rows") and excluding:
-            note += (
-                f" {spikes['test_rows']} readings in the window are unexplained spikes (shaded on the chart below); "
-                f"without them the recent average error is {excluding['mae']:.2f} {unit}."
-            )
-        st.caption(note)
 
     test_df = pd.DataFrame(target_data.get("test_predictions", []))
     if test_df.empty:
@@ -2560,12 +2682,11 @@ else:
         default_page = st.session_state["page"]
 
 nav_options = ["Overview", "Prediction", "Injection Optimization Simulator", "SEGY Analysis", "AI Chatbot"]
-try:
-    default_index = nav_options.index(default_page)
-except Exception:
-    default_index = 0
-# Use a selectbox as a compact menu in the sidebar
-page = st.sidebar.selectbox("Menu", nav_options, index=default_index)
+# Use a selectbox as a compact menu in the sidebar. A fixed key keeps it the same widget on every run;
+# passing a changing index instead made Streamlit rebuild it, so the first choice after a page change was lost.
+if st.session_state.get("nav_page") not in nav_options:
+    st.session_state["nav_page"] = default_page if default_page in nav_options else nav_options[0]
+page = st.sidebar.selectbox("Menu", nav_options, key="nav_page")
 st.session_state["page"] = page
 if callable(set_qs):
     set_qs(page=page)
@@ -2795,7 +2916,7 @@ elif page == "Injection Optimization Simulator":
                 "Follow simulated time",
                 value=True,
                 key="optimizer_follow_live",
-                help="On: the conditions update to the reading at the dashboard's simulated time every minute. "
+                help="On: the conditions update to the reading at the dashboard's simulated time every 5 minutes. "
                      "Off: edit them freely to test a what-if scenario.",
             )
         for field, key in condition_keys.items():
@@ -3025,13 +3146,23 @@ elif page == "SEGY Analysis":
     if not available_events:
         st.warning("No SEGY files were found in data/segy.", icon=":material/warning:")
     else:
+        render_segy_event_overview()
+        # Keyed selectors, so a row click in the overview can set them. Fall back to a valid choice when needed.
+        if st.session_state.get("segy_event") not in available_events:
+            st.session_state["segy_event"] = available_events[0]
         with st.container(border=True):
             event_col, well_col, channel_col = st.columns([1, 1, 1.2])
             with event_col:
-                event_id = st.selectbox("Event ID", available_events, format_func=lambda value: f"Event {value}")
+                event_id = st.selectbox("Event ID", available_events, format_func=lambda value: f"Event {value}", key="segy_event",
+                                        on_change=clear_segy_overview_ticks)
             available_wells = [well for event, well in file_index if event == event_id]
+            event_changed = st.session_state.get("segy_last_event") != event_id
+            st.session_state["segy_last_event"] = event_id
+            if available_wells and (event_changed or "segy_well" not in st.session_state) \
+                    and st.session_state.get("segy_well") not in available_wells:
+                st.session_state["segy_well"] = available_wells[0]
             with well_col:
-                well = st.selectbox("Recording well", well_options, index=well_options.index(available_wells[0]) if available_wells else 0)
+                well = st.selectbox("Recording well", well_options, key="segy_well", on_change=clear_segy_overview_ticks)
             selected_path = file_index.get((event_id, well))
             event = EVENT_CATALOG.get(event_id, {})
             with channel_col:
@@ -3088,8 +3219,16 @@ elif page == "SEGY Analysis":
                 show_metric(kpi_cols[1], "Magnitude", catalog_value("magnitude"), border=True)
                 show_metric(kpi_cols[2], "Depth", catalog_value("depth", " m"), border=True)
                 show_metric(kpi_cols[3], "Corner frequency", catalog_value("corner", " Hz"), border=True)
-                show_metric(kpi_cols[4], "Date / time", event.get("date", "N/A"), border=True)
-                show_metric(kpi_cols[5], "UTM East / North", f"{event.get('easting', 'N/A')} / {event.get('northing', 'N/A')}", border=True)
+                # The date and the coordinate pair are too long for the standard metric size, so their values are
+                # shown smaller (kept vertically centred so the cards match the height of their neighbours).
+                st.html(
+                    "<style>[class*='st-key-segy_small_metric'] [data-testid='stMetricValue'] {font-size: 1.35rem; "
+                    "min-height: 3.25rem; display: flex; align-items: center; white-space: nowrap;}</style>"
+                )
+                with kpi_cols[4].container(key="segy_small_metric_date"):
+                    show_metric(st, "Date / time", event.get("date", "N/A"), border=True)
+                with kpi_cols[5].container(key="segy_small_metric_utm"):
+                    show_metric(st, "UTM East / North", f"{event.get('easting', 'N/A')} / {event.get('northing', 'N/A')}", border=True)
 
                 map_col, timeline_col = st.columns(2)
                 catalog_df = pd.DataFrame([{"event_id": event_number, **metadata} for event_number, metadata in EVENT_CATALOG.items()])
